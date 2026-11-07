@@ -1,0 +1,1030 @@
+local Players = game:GetService("Players")
+local RS = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local UIS = game:GetService("UserInputService")
+
+local lp = Players.LocalPlayer
+local cam = workspace.CurrentCamera
+
+-- Re-run safe. The other toy scripts use the same toys, so unload them too.
+local env = (getgenv and getgenv()) or _G
+if env.FTAPUfoUnload then pcall(env.FTAPUfoUnload) end
+for _, k in ipairs({
+	"FTAPSusanooForm1Unload", "FTAPSusanooHalfUnload", "FTAPSusanooUnload",
+	"FTAPHandUnload", "FTAPSnakeUnload",
+}) do
+	if env[k] then pcall(env[k]) end
+end
+
+local MAX_TOYS = 20
+local TAU = math.pi * 2
+local V = Vector3.new
+local TURN_RATE = 1.3 -- plane turn speed (rad/s)
+
+----------------------------------------------------------------
+-- State
+----------------------------------------------------------------
+local S = {
+	active = false,
+	busy = false,
+	dead = false,
+	mode = "ufo", -- ufo | plane
+	auto = false, -- autopilot
+	safe = true, -- indestructible protections
+	ride = false, -- carry you on top (off = you stay on the ground)
+	skin = true, -- detailed local model
+	beam = true, -- tractor beam (UFO)
+	camUFO = true, -- camera follows the craft while you fly by hand
+	chase = false,
+	size = 6, -- studs per unit
+	speed = 60,
+	upHeld = false,
+	downHeld = false,
+}
+local claimed = {} -- { part, bp, bg, si, oldCollide }
+local claimedSet = {}
+local heartbeat
+local conns = {}
+local skin = nil
+local camPart = nil
+local savedHum = nil
+local lastSubject = nil
+
+-- flight state
+local pos = Vector3.zero
+local vel = Vector3.zero
+local spin = 0
+local prop = 0
+local morph = 0 -- 0 = UFO, 1 = plane
+local fwd = V(0, 0, -1) -- plane heading (flat)
+local pitch = 0
+local bank = 0
+local autoTarget = nil
+local autoUntil = 0
+local safeTimer, refillTimer, reclaimIdx = 0, 0, 0
+
+local rayParams = RaycastParams.new()
+rayParams.FilterType = Enum.RaycastFilterType.Exclude
+
+local function getRoot()
+	local char = lp.Character
+	return char and char:FindFirstChild("HumanoidRootPart")
+end
+
+local function getHum()
+	local char = lp.Character
+	return char and char:FindFirstChildOfClass("Humanoid")
+end
+
+local function smooth(x)
+	x = math.clamp(x, 0, 1)
+	return x * x * (3 - 2 * x)
+end
+
+----------------------------------------------------------------
+-- Toy layouts: slot i has a UFO position and a PLANE position
+-- (priority order: with fewer than 20 toys you keep the core of both)
+----------------------------------------------------------------
+local U = { { k = "apex" }, { k = "bottom" } }
+for i = 1, 10 do table.insert(U, { k = "rim", i = i }) end
+for i = 1, 5 do table.insert(U, { k = "inner", i = i }) end
+for i = 1, 3 do table.insert(U, { k = "dome", i = i }) end
+
+local PL = {
+	{ k = "fus", z = 0 }, { k = "fus", z = -1.2 }, { k = "fus", z = 1.2 },
+	{ k = "fus", z = -2.4 }, { k = "fus", z = 2.4 },
+	{ k = "fus", z = -3.6 }, { k = "fus", z = 3.6 },
+	{ k = "wing", x = 1.2 }, { k = "wing", x = -1.2 },
+	{ k = "wing", x = 2.4 }, { k = "wing", x = -2.4 },
+	{ k = "wing", x = 3.6 }, { k = "wing", x = -3.6 },
+	{ k = "wing", x = 4.8 }, { k = "wing", x = -4.8 },
+	{ k = "tailV", y = 0.9 }, { k = "tailV", y = 1.8 },
+	{ k = "stab", x = 1.4 }, { k = "stab", x = -1.4 },
+	{ k = "prop" },
+}
+
+local function ufoLocal(s, sp)
+	local k = s.k
+	if k == "apex" then
+		return V(0, 1.9, 0)
+	elseif k == "bottom" then
+		return V(0, -1.0, 0)
+	elseif k == "rim" then
+		local a = sp + (s.i - 1) * TAU / 10
+		return V(math.cos(a) * 4, 0, math.sin(a) * 4)
+	elseif k == "inner" then
+		local a = -sp * 0.6 + (s.i - 1) * TAU / 5
+		return V(math.cos(a) * 2.3, 0.4, math.sin(a) * 2.3)
+	else
+		local a = sp * 1.5 + (s.i - 1) * TAU / 3
+		return V(math.cos(a) * 0.9, 1.1, math.sin(a) * 0.9)
+	end
+end
+
+-- plane: nose = -z, wings along x
+local function planeLocal(s, pr)
+	local k = s.k
+	if k == "fus" then
+		return V(0, 0, s.z)
+	elseif k == "wing" then
+		return V(s.x, 0, -0.2 + math.abs(s.x) * 0.18) -- swept back
+	elseif k == "tailV" then
+		return V(0, s.y, 3.4 + s.y * 0.15)
+	elseif k == "stab" then
+		return V(s.x, 0.2, 3.7)
+	else
+		return V(math.cos(pr) * 0.9, math.sin(pr) * 0.9, -4.8) -- propeller
+	end
+end
+
+----------------------------------------------------------------
+-- Toys
+----------------------------------------------------------------
+local function getToyFolder()
+	return workspace:FindFirstChild(lp.Name .. "SpawnedInToys")
+		or workspace:FindFirstChild("Ketik_Ketikketik4SpawnedInToys")
+end
+
+local function getToyParts()
+	local parts = {}
+	local folder = getToyFolder()
+	if not folder then return parts end
+	for _, toy in ipairs(folder:GetChildren()) do
+		local sp = toy:FindFirstChild("SoundPart")
+		if sp and sp:IsA("BasePart") then
+			table.insert(parts, sp)
+			if #parts >= MAX_TOYS then break end
+		end
+	end
+	return parts
+end
+
+local function claim(part)
+	-- The remote name/arguments may change when the game updates.
+	return pcall(function()
+		RS.GrabEvents.SetNetworkOwner:FireServer(part, part.CFrame)
+	end)
+end
+
+-- does this client still own the part? (executor helper; unknown = false)
+local function ownsPart(part)
+	if isnetworkowner then
+		local ok, r = pcall(isnetworkowner, part)
+		if ok then return r end
+	end
+	return false
+end
+
+local function makeMovers(c)
+	local part = c.part
+	if not (c.bp and c.bp.Parent == part) then
+		local bp = Instance.new("BodyPosition")
+		bp.MaxForce = Vector3.new(1e9, 1e9, 1e9)
+		bp.P = 25000
+		bp.D = 1200
+		bp.Position = part.Position
+		bp.Parent = part
+		c.bp = bp
+	end
+	if not (c.bg and c.bg.Parent == part) then
+		local bg = Instance.new("BodyGyro")
+		bg.MaxTorque = Vector3.new(1e9, 1e9, 1e9)
+		bg.P = 25000
+		bg.CFrame = part.CFrame
+		bg.Parent = part
+		c.bg = bg
+	end
+end
+
+local function addToy(part, si)
+	local c = { part = part, si = si, oldCollide = part.CanCollide }
+	part.CanCollide = false
+	makeMovers(c)
+	table.insert(claimed, c)
+	claimedSet[part] = c
+	return c
+end
+
+-- drop destroyed toys and pick up new ones to fill the free slots
+local function refill()
+	for i = #claimed, 1, -1 do
+		local c = claimed[i]
+		if not c.part.Parent then
+			claimedSet[c.part] = nil
+			table.remove(claimed, i)
+		end
+	end
+	if #claimed >= #U then return end
+	local used = {}
+	for _, c in ipairs(claimed) do used[c.si] = true end
+	for _, part in ipairs(getToyParts()) do
+		if not claimedSet[part] then
+			local si
+			for i = 1, #U do
+				if not used[i] then si = i break end
+			end
+			if not si then break end
+			if claim(part) then
+				used[si] = true
+				addToy(part, si)
+			end
+		end
+	end
+end
+
+----------------------------------------------------------------
+-- SKIN: detailed models (client-side parts, only you see them)
+----------------------------------------------------------------
+local function mk(parent, shape, size, cf, color, material, transparency)
+	local p = Instance.new("Part")
+	p.Anchored = true
+	p.CanCollide = false
+	p.CanQuery = false
+	p.CanTouch = false
+	p.Massless = true
+	p.CastShadow = false
+	if shape then p.Shape = shape end
+	p.Size = size
+	p.CFrame = cf
+	p.Color = color
+	p.Material = material
+	p.Transparency = transparency or 0
+	p.Parent = parent
+	return p
+end
+
+local function newModel(parent, name)
+	local m = Instance.new("Model")
+	m.Name = name
+	local root = mk(m, nil, V(0.2, 0.2, 0.2), CFrame.new(), Color3.new(), Enum.Material.SmoothPlastic, 1)
+	m.PrimaryPart = root
+	m.Parent = parent
+	return m
+end
+
+local function destroySkin()
+	if skin then
+		skin.model:Destroy()
+		if skin.planeG and not skin.planeG.Parent then skin.planeG:Destroy() end
+		if skin.ufoG and not skin.ufoG.Parent then skin.ufoG:Destroy() end
+		skin = nil
+	end
+end
+
+local function buildUfoSkin(parent, sz)
+	local ufo = { }
+	local hull = newModel(parent, "Hull")
+	local flat = CFrame.Angles(0, 0, math.pi / 2) -- cylinder axis -> up
+	local function disc(y, dia, thick, color, material, transparency)
+		return mk(hull, Enum.PartType.Cylinder, V(thick * sz, dia * sz, dia * sz),
+			CFrame.new(0, y * sz, 0) * flat, color, material, transparency)
+	end
+	disc(0.00, 8.0, 0.8, Color3.fromRGB(170, 175, 190), Enum.Material.Metal)
+	disc(0.55, 6.2, 0.5, Color3.fromRGB(150, 156, 175), Enum.Material.Metal)
+	disc(-0.55, 5.0, 0.5, Color3.fromRGB(105, 110, 130), Enum.Material.Metal)
+	disc(-0.95, 2.0, 0.4, Color3.fromRGB(80, 255, 255), Enum.Material.Neon)
+	disc(0.0, 8.15, 0.18, Color3.fromRGB(70, 75, 95), Enum.Material.Metal)
+	mk(hull, Enum.PartType.Ball, V(3.2, 3.2, 3.2) * sz, CFrame.new(0, 1.0 * sz, 0),
+		Color3.fromRGB(130, 225, 255), Enum.Material.Glass, 0.45)
+	mk(hull, Enum.PartType.Ball, V(1.1, 1.1, 1.1) * sz, CFrame.new(0, 1.0 * sz, 0),
+		Color3.fromRGB(120, 255, 170), Enum.Material.Neon, 0.15)
+	mk(hull, nil, V(0.12, 0.9, 0.12) * sz, CFrame.new(0, 2.75 * sz, 0),
+		Color3.fromRGB(190, 195, 210), Enum.Material.Metal)
+	mk(hull, Enum.PartType.Ball, V(0.3, 0.3, 0.3) * sz, CFrame.new(0, 3.25 * sz, 0),
+		Color3.fromRGB(255, 80, 80), Enum.Material.Neon)
+	ufo.hull = hull
+
+	local lights = newModel(parent, "Lights")
+	ufo.rimLights = {}
+	local N = 16
+	for i = 1, N do
+		local a = (i - 1) * TAU / N
+		table.insert(ufo.rimLights, mk(lights, Enum.PartType.Ball, V(0.5, 0.5, 0.5) * sz,
+			CFrame.new(math.cos(a) * 4.0 * sz, 0, math.sin(a) * 4.0 * sz),
+			Color3.new(1, 1, 1), Enum.Material.Neon))
+	end
+	for i = 1, 8 do
+		local a = (i - 1) * TAU / 8
+		mk(lights, Enum.PartType.Ball, V(0.42, 0.42, 0.42) * sz,
+			CFrame.new(math.cos(a) * 2.3 * sz, -0.8 * sz, math.sin(a) * 2.3 * sz),
+			Color3.fromRGB(255, 240, 150), Enum.Material.Neon)
+	end
+	ufo.lights = lights
+
+	ufo.beam = mk(parent, Enum.PartType.Cylinder, V(10, 3.5 * sz, 3.5 * sz), CFrame.new(),
+		Color3.fromRGB(150, 255, 200), Enum.Material.Neon, 0.8)
+	return ufo
+end
+
+local function buildPlaneSkin(parent, sz)
+	local pl = {}
+	local body = newModel(parent, "Body")
+	local WHITE = Color3.fromRGB(228, 232, 242)
+	local RED = Color3.fromRGB(205, 55, 55)
+	local DARK = Color3.fromRGB(70, 75, 90)
+
+	local function cylZ(x, y, z, len, dia, color, mat, tr)
+		return mk(body, Enum.PartType.Cylinder, V(len * sz, dia * sz, dia * sz),
+			CFrame.new(x * sz, y * sz, z * sz) * CFrame.Angles(0, math.pi / 2, 0), color, mat, tr)
+	end
+	local function ball(x, y, z, dx, dy, dz, color, mat, tr)
+		return mk(body, Enum.PartType.Ball, V(dx, dy, dz) * sz,
+			CFrame.new(x * sz, y * sz, z * sz), color, mat, tr)
+	end
+	local function blk(x, y, z, w, h, d, rot, color, mat, tr)
+		return mk(body, nil, V(w, h, d) * sz,
+			CFrame.new(x * sz, y * sz, z * sz) * (rot or CFrame.new()), color, mat, tr)
+	end
+
+	-- fuselage, nose, tail cone, cockpit
+	cylZ(0, 0, 0, 8.0, 1.1, WHITE, Enum.Material.Metal)
+	cylZ(0, 0, -0.5, 3.2, 1.12, RED, Enum.Material.Metal) -- red band
+	ball(0, 0, -4.0, 1.1, 1.1, 1.1, RED, Enum.Material.Metal)
+	ball(0, 0.05, 4.0, 0.8, 0.8, 0.8, WHITE, Enum.Material.Metal)
+	ball(0, 0.5, -1.6, 0.8, 0.7, 1.6, Color3.fromRGB(130, 225, 255), Enum.Material.Glass, 0.35)
+
+	-- swept wings + wing engines
+	blk(2.45, -0.10, 0.3, 5.0, 0.14, 1.7, CFrame.Angles(0, -0.22, 0), WHITE, Enum.Material.Metal)
+	blk(-2.45, -0.10, 0.3, 5.0, 0.14, 1.7, CFrame.Angles(0, 0.22, 0), WHITE, Enum.Material.Metal)
+	for _, sx in ipairs({ -1, 1 }) do
+		cylZ(sx * 1.6, -0.40, -0.1, 1.2, 0.55, DARK, Enum.Material.Metal)
+		ball(sx * 1.6, -0.40, 0.65, 0.45, 0.45, 0.45, Color3.fromRGB(255, 150, 60), Enum.Material.Neon)
+	end
+
+	-- tail fin + stabilizers
+	blk(0, 1.0, 3.3, 0.12, 1.6, 1.2, CFrame.Angles(0.25, 0, 0), RED, Enum.Material.Metal)
+	blk(1.0, 0.2, 3.65, 1.6, 0.1, 0.9, CFrame.Angles(0, -0.25, 0), WHITE, Enum.Material.Metal)
+	blk(-1.0, 0.2, 3.65, 1.6, 0.1, 0.9, CFrame.Angles(0, 0.25, 0), WHITE, Enum.Material.Metal)
+
+	-- navigation lights
+	ball(-4.85, -0.10, 1.0, 0.25, 0.25, 0.25, Color3.fromRGB(255, 40, 40), Enum.Material.Neon)
+	ball(4.85, -0.10, 1.0, 0.25, 0.25, 0.25, Color3.fromRGB(40, 255, 90), Enum.Material.Neon)
+	pl.strobe = ball(0, 1.95, 3.85, 0.25, 0.25, 0.25, Color3.new(1, 1, 1), Enum.Material.Neon)
+	pl.body = body
+
+	-- propeller (spins)
+	local propM = newModel(parent, "Prop")
+	mk(propM, nil, V(0.14, 2.4, 0.08) * sz, CFrame.new(), DARK, Enum.Material.Metal, 0.3)
+	mk(propM, nil, V(2.4, 0.14, 0.08) * sz, CFrame.new(), DARK, Enum.Material.Metal, 0.3)
+	mk(propM, Enum.PartType.Ball, V(0.4, 0.4, 0.4) * sz, CFrame.new(0, 0, -0.1 * sz), RED, Enum.Material.Metal)
+	pl.prop = propM
+	return pl
+end
+
+local function buildSkin()
+	destroySkin()
+	local sz = S.size
+	local model = Instance.new("Model")
+	model.Name = "UFOSkin"
+	skin = { model = model, showPlane = (morph >= 0.5) }
+
+	skin.ufoG = Instance.new("Model")
+	skin.ufoG.Name = "UFO"
+	skin.ufo = buildUfoSkin(skin.ufoG, sz)
+
+	skin.planeG = Instance.new("Model")
+	skin.planeG.Name = "Plane"
+	skin.plane = buildPlaneSkin(skin.planeG, sz)
+
+	-- only the active shape is parented
+	if skin.showPlane then skin.planeG.Parent = model else skin.ufoG.Parent = model end
+
+	-- outline so you can always find it, even far away or behind things
+	local hl = Instance.new("Highlight")
+	hl.Adornee = model
+	hl.FillTransparency = 1
+	hl.OutlineColor = Color3.fromRGB(150, 255, 255)
+	hl.OutlineTransparency = 0.25
+	hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+	hl.Parent = model
+
+	model.Parent = workspace
+end
+
+----------------------------------------------------------------
+-- GUI
+----------------------------------------------------------------
+local gui = Instance.new("ScreenGui")
+gui.Name = "FTAPUfoGui"
+gui.ResetOnSpawn = false
+local okParent = pcall(function()
+	gui.Parent = (gethui and gethui()) or game:GetService("CoreGui")
+end)
+if not okParent then gui.Parent = lp:WaitForChild("PlayerGui") end
+
+local GUI_H = 312
+local main = Instance.new("Frame")
+main.Size = UDim2.fromOffset(200, GUI_H)
+main.Position = UDim2.new(0, 12, 0, 72)
+main.BackgroundColor3 = Color3.fromRGB(24, 24, 30)
+main.BorderSizePixel = 0
+main.Parent = gui
+Instance.new("UICorner", main).CornerRadius = UDim.new(0, 10)
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, -66, 0, 32)
+title.Position = UDim2.fromOffset(10, 0)
+title.BackgroundTransparency = 1
+title.Text = "UFO / Plane"
+title.TextColor3 = Color3.new(1, 1, 1)
+title.Font = Enum.Font.GothamBold
+title.TextSize = 14
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.Parent = main
+
+local body = Instance.new("Frame")
+body.Size = UDim2.new(1, 0, 1, -32)
+body.Position = UDim2.fromOffset(0, 32)
+body.BackgroundTransparency = 1
+body.Parent = main
+
+local status = Instance.new("TextLabel")
+status.Size = UDim2.new(1, -20, 0, 20)
+status.Position = UDim2.fromOffset(10, 2)
+status.BackgroundTransparency = 1
+status.Text = "Status: idle"
+status.TextColor3 = Color3.fromRGB(170, 170, 185)
+status.Font = Enum.Font.Gotham
+status.TextSize = 12
+status.TextXAlignment = Enum.TextXAlignment.Left
+status.Parent = body
+
+local function setStatus(t) status.Text = "Status: " .. t end
+
+local function makeButton(text, x, y, w, h, cb)
+	local b = Instance.new("TextButton")
+	b.Size = UDim2.fromOffset(w, h)
+	b.Position = UDim2.fromOffset(x, y)
+	b.BackgroundColor3 = Color3.fromRGB(52, 52, 66)
+	b.TextColor3 = Color3.new(1, 1, 1)
+	b.Font = Enum.Font.GothamMedium
+	b.TextSize = 13
+	b.Text = text
+	b.BorderSizePixel = 0
+	b.Parent = body
+	Instance.new("UICorner", b).CornerRadius = UDim.new(0, 7)
+	b.MouseButton1Click:Connect(function() cb(b) end)
+	return b
+end
+
+local function makeLabel(text, x, y, w)
+	local l = Instance.new("TextLabel")
+	l.Size = UDim2.fromOffset(w, 28)
+	l.Position = UDim2.fromOffset(x, y)
+	l.BackgroundTransparency = 1
+	l.Text = text
+	l.TextColor3 = Color3.new(1, 1, 1)
+	l.Font = Enum.Font.Gotham
+	l.TextSize = 13
+	l.Parent = body
+	return l
+end
+
+local function makeHoldButton(text, x, y, w, h, setHeld)
+	local b = makeButton(text, x, y, w, h, function() end)
+	b.MouseButton1Down:Connect(function() setHeld(true) end)
+	b.MouseButton1Up:Connect(function() setHeld(false) end)
+	b.MouseLeave:Connect(function() setHeld(false) end)
+	return b
+end
+
+local buildBtn, modeBtn, autoBtn
+
+----------------------------------------------------------------
+-- Control mode + camera
+----------------------------------------------------------------
+local function restoreHum()
+	if savedHum and savedHum.hum and savedHum.hum.Parent then
+		local h = savedHum.hum
+		h.WalkSpeed = savedHum.WalkSpeed
+		h.JumpPower = savedHum.JumpPower
+		h.JumpHeight = savedHum.JumpHeight
+	end
+	savedHum = nil
+end
+
+local function freezeHum(hum)
+	if savedHum and savedHum.hum == hum then return end
+	restoreHum()
+	savedHum = {
+		hum = hum,
+		WalkSpeed = hum.WalkSpeed,
+		JumpPower = hum.JumpPower,
+		JumpHeight = hum.JumpHeight,
+	}
+	hum.WalkSpeed = 0
+	hum.JumpPower = 0
+	hum.JumpHeight = 0
+end
+
+local function applyMode(hum)
+	-- walking is frozen only while you steer by hand
+	if S.auto then restoreHum() else freezeHum(hum) end
+
+	-- plane + manual + camera "follow" = scripted chase camera
+	local chase = (S.mode == "plane") and (not S.auto) and S.camUFO and (not S.ride)
+	S.chase = chase
+	if chase then
+		if cam.CameraType ~= Enum.CameraType.Scriptable then
+			cam.CameraType = Enum.CameraType.Scriptable
+		end
+		lastSubject = nil
+	else
+		if cam.CameraType ~= Enum.CameraType.Custom then
+			cam.CameraType = Enum.CameraType.Custom
+		end
+		local want = hum
+		if camPart and (not S.auto) and S.camUFO and (not S.ride) then want = camPart end
+		if lastSubject ~= want then
+			cam.CameraSubject = want
+			lastSubject = want
+		end
+	end
+end
+
+local function setMode(newMode)
+	if S.mode == newMode then return end
+	S.mode = newMode
+	if newMode == "plane" then
+		-- start flying the way the craft is already moving (or the way you look)
+		local hv = V(vel.X, 0, vel.Z)
+		if hv.Magnitude > 2 then
+			fwd = hv.Unit
+		else
+			local look = cam.CFrame.LookVector
+			local f = V(look.X, 0, look.Z)
+			fwd = f.Magnitude > 1e-3 and f.Unit or V(0, 0, -1)
+		end
+		pitch, bank = 0, 0
+	end
+	autoTarget = nil
+	if modeBtn then modeBtn.Text = "Mode: " .. (newMode == "plane" and "Plane" or "UFO") end
+	if S.active then setStatus(newMode == "plane" and "plane mode" or "UFO mode") end
+end
+
+local function pickTarget(root, t)
+	local ang = math.random() * TAU
+	local rad = math.random(80, 260)
+	autoTarget = V(
+		root.Position.X + math.cos(ang) * rad,
+		root.Position.Y + math.random(45, 140),
+		root.Position.Z + math.sin(ang) * rad
+	)
+	autoUntil = t + 16
+end
+
+----------------------------------------------------------------
+-- Flight models
+----------------------------------------------------------------
+local function flyUfo(dt, root, hum, t)
+	local targetVel
+	if S.auto then
+		if not autoTarget or (autoTarget - pos).Magnitude < 15 or t > autoUntil then
+			pickTarget(root, t)
+		end
+		local d = autoTarget - pos
+		targetVel = (d.Magnitude > 1e-3 and d.Unit or V(0, 0, 0)) * (S.speed * 0.75)
+	else
+		local md = hum.MoveDirection
+		local v = (S.upHeld and 1 or 0) - (S.downHeld and 1 or 0)
+		targetVel = V(md.X, 0, md.Z) * S.speed + V(0, v * S.speed * 0.6, 0)
+	end
+	vel = vel:Lerp(targetVel, 1 - math.exp(-dt * 1.8))
+end
+
+local function flyPlane(dt, root, hum, t)
+	local desired, pitchTarget = nil, 0
+	if S.auto then
+		if not autoTarget or (autoTarget - pos).Magnitude < 40 or t > autoUntil then
+			pickTarget(root, t)
+		end
+		local d = autoTarget - pos
+		local flat = V(d.X, 0, d.Z)
+		if flat.Magnitude > 1 then desired = flat.Unit end
+		pitchTarget = math.clamp(d.Y / 80, -1, 1) * math.rad(28)
+	else
+		local md = hum.MoveDirection
+		local flat = V(md.X, 0, md.Z)
+		if flat.Magnitude > 0.1 then desired = flat.Unit end
+		local v = (S.upHeld and 1 or 0) - (S.downHeld and 1 or 0)
+		pitchTarget = v * math.rad(30)
+	end
+
+	-- turn toward the wanted heading at a limited rate
+	local diff = 0
+	if desired then
+		local psi = math.atan2(-fwd.X, -fwd.Z)
+		local psiD = math.atan2(-desired.X, -desired.Z)
+		diff = (psiD - psi + math.pi) % TAU - math.pi
+		psi += math.clamp(diff, -TURN_RATE * dt, TURN_RATE * dt)
+		fwd = V(-math.sin(psi), 0, -math.cos(psi))
+	end
+	bank += (math.clamp(diff * 1.2, -0.9, 0.9) - bank) * math.min(1, dt * 4)
+	pitch += (pitchTarget - pitch) * math.min(1, dt * 2.5)
+
+	local speed = math.max(45, S.speed * 1.5)
+	local dir = V(fwd.X * math.cos(pitch), math.sin(pitch), fwd.Z * math.cos(pitch))
+	vel = vel:Lerp(dir * speed, 1 - math.exp(-dt * 2))
+end
+
+----------------------------------------------------------------
+-- Main loop
+----------------------------------------------------------------
+local function step(dt)
+	local root, hum = getRoot(), getHum()
+	if not root or not hum then return end
+	local t = tick()
+
+	applyMode(hum)
+
+	-- morph progress (1.2 s)
+	local goal = (S.mode == "plane") and 1 or 0
+	morph += math.clamp(goal - morph, -dt / 1.2, dt / 1.2)
+	local m = smooth(morph)
+
+	if S.mode == "plane" then
+		flyPlane(dt, root, hum, t)
+	else
+		flyUfo(dt, root, hum, t)
+	end
+	pos += vel * dt
+
+	-- ground clearance
+	local ignore = { lp.Character }
+	local folder = getToyFolder()
+	if folder then table.insert(ignore, folder) end
+	if skin then table.insert(ignore, skin.model) end
+	rayParams.FilterDescendantsInstances = ignore
+	local hit = workspace:Raycast(V(pos.X, pos.Y + 300, pos.Z), V(0, -2000, 0), rayParams)
+	local groundY = hit and hit.Position.Y or nil
+	if groundY then
+		local minY = groundY + S.size * 1.4
+		if pos.Y < minY then
+			pos = V(pos.X, pos.Y + (minY - pos.Y) * math.min(1, dt * 6), pos.Z)
+			vel = V(vel.X, math.max(vel.Y, 0), vel.Z)
+		end
+	end
+	-- indestructible: never fall into the void
+	if S.safe then
+		local floor = workspace.FallenPartsDestroyHeight + 100
+		if pos.Y < floor then
+			pos = V(pos.X, floor, pos.Z)
+			vel = V(vel.X, math.max(vel.Y, 0), vel.Z)
+		end
+	end
+
+	spin += dt * 0.9
+	prop += dt * 30
+
+	-- body orientation for each shape, blended by the morph
+	local hv = V(vel.X, 0, vel.Z)
+	local tilt = CFrame.new()
+	if hv.Magnitude > 1 then
+		local axis = Vector3.yAxis:Cross(hv.Unit)
+		tilt = CFrame.fromAxisAngle(axis, math.clamp(hv.Magnitude / S.speed, 0, 1.2) * math.rad(18))
+	end
+	local wob = CFrame.Angles(math.sin(t * 1.7) * 0.03, 0, math.cos(t * 1.3) * 0.03)
+	local ufoBody = CFrame.new(pos + V(0, math.sin(t * 1.2) * 0.6, 0)) * tilt * wob
+
+	local fwdF = V(fwd.X * math.cos(pitch), math.sin(pitch), fwd.Z * math.cos(pitch))
+	local planeBody = CFrame.lookAt(pos, pos + fwdF) * CFrame.Angles(0, 0, bank)
+
+	local bodyCF = ufoBody:Lerp(planeBody, m)
+	local sz = S.size
+
+	-- camera anchor / chase camera
+	if camPart then camPart.CFrame = CFrame.new(bodyCF.Position) end
+	if S.chase then
+		local camPos = pos - fwdF * (sz * 10) + V(0, sz * 3, 0)
+		local target = CFrame.lookAt(camPos, pos + fwdF * (sz * 8))
+		cam.CFrame = cam.CFrame:Lerp(target, math.min(1, dt * 5))
+	end
+
+	-- ride on top (optional)
+	if S.ride then
+		local seat = bodyCF:PointToWorldSpace(V(0, 2.7 * sz + 3, 0):Lerp(V(0, 1.0 * sz + 3, -1.6 * sz), m))
+		root.CFrame = CFrame.new(seat) * root.CFrame.Rotation
+		root.AssemblyLinearVelocity = Vector3.zero
+		root.AssemblyAngularVelocity = Vector3.zero
+	end
+
+	-- detailed skin: show the shape we are (becoming)
+	if S.skin and skin then
+		local showPlane = m >= 0.5
+		if skin.showPlane ~= showPlane then
+			skin.showPlane = showPlane
+			skin.ufoG.Parent = (not showPlane) and skin.model or nil
+			skin.planeG.Parent = showPlane and skin.model or nil
+		end
+		if showPlane then
+			skin.plane.body:PivotTo(bodyCF)
+			skin.plane.prop:PivotTo(bodyCF * CFrame.new(0, 0, -4.45 * sz) * CFrame.Angles(0, 0, prop))
+			skin.plane.strobe.Transparency = (math.floor(t * 3) % 2 == 0) and 0 or 1
+		else
+			local u = skin.ufo
+			u.hull:PivotTo(bodyCF)
+			u.lights:PivotTo(bodyCF * CFrame.Angles(0, -spin, 0))
+			local n = #u.rimLights
+			for i, p in ipairs(u.rimLights) do
+				p.Color = Color3.fromHSV((t * 0.25 + i / n) % 1, 0.8, 1)
+			end
+			local beamLen = groundY and ((bodyCF.Position.Y - 0.95 * sz) - groundY) or 0
+			if S.beam and beamLen > 2 then
+				u.beam.Transparency = 0.8
+				u.beam.Size = V(beamLen, 3.5 * sz, 3.5 * sz)
+				u.beam.CFrame = CFrame.new(bodyCF.Position - V(0, 0.95 * sz + beamLen / 2, 0))
+					* CFrame.Angles(0, 0, math.pi / 2)
+			else
+				u.beam.Transparency = 1
+			end
+		end
+	end
+
+	-- indestructible upkeep: one toy re-claimed every 0.1 s, refill every 1.5 s
+	if S.safe then
+		safeTimer += dt
+		if safeTimer >= 0.1 and #claimed > 0 then
+			safeTimer = 0
+			reclaimIdx = reclaimIdx % #claimed + 1
+			local c = claimed[reclaimIdx]
+			if c.part.Parent then
+				if not ownsPart(c.part) then claim(c.part) end
+				c.part.CanCollide = false
+			end
+		end
+		refillTimer += dt
+		if refillTimer >= 1.5 then
+			refillTimer = 0
+			refill()
+		end
+	end
+
+	-- toys form the craft
+	local rot = bodyCF.Rotation
+	for _, c in ipairs(claimed) do
+		local part = c.part
+		if part.Parent then
+			local u = ufoLocal(U[c.si], spin)
+			local p = planeLocal(PL[c.si], prop)
+			local lp3 = u:Lerp(p, m)
+			if m > 0 and m < 1 then lp3 += V(0, math.sin(m * math.pi) * 2.5, 0) end
+			local target = bodyCF:PointToWorldSpace(lp3 * sz)
+
+			if S.safe then
+				makeMovers(c) -- rebuild movers if something removed them
+				local lv = part.AssemblyLinearVelocity
+				if lv.Magnitude > S.speed * 3 + 250 then -- flung: stop it
+					part.AssemblyLinearVelocity = Vector3.zero
+					part.AssemblyAngularVelocity = Vector3.zero
+				end
+				if (part.Position - target).Magnitude > 300 then -- thrown away: pull it back
+					part.CFrame = CFrame.new(target)
+				end
+			end
+			c.bp.Position = target
+			c.bg.CFrame = rot
+		end
+	end
+end
+
+----------------------------------------------------------------
+-- Summon / release
+----------------------------------------------------------------
+local function release()
+	S.active = false
+	if heartbeat then heartbeat:Disconnect() heartbeat = nil end
+	for _, c in ipairs(claimed) do
+		if c.bp then c.bp:Destroy() end
+		if c.bg then c.bg:Destroy() end
+		if c.part and c.part.Parent then c.part.CanCollide = c.oldCollide end
+	end
+	claimed = {}
+	claimedSet = {}
+	destroySkin()
+	restoreHum()
+	cam.CameraType = Enum.CameraType.Custom
+	local hum = getHum()
+	if hum then cam.CameraSubject = hum end
+	lastSubject = nil
+	if camPart then camPart:Destroy() camPart = nil end
+	if buildBtn then buildBtn.Text = "Summon" end
+	setStatus("released")
+end
+
+local function build()
+	if S.busy or S.active then return end
+	local root = getRoot()
+	if not root then setStatus("no character") return end
+
+	local parts = getToyParts()
+	if #parts == 0 then setStatus("no toys found") return end
+
+	S.busy = true
+	setStatus("claiming toys...")
+	local origin = root.CFrame
+	local teleported = false
+
+	for i = 1, math.min(#U, #parts) do
+		local part = parts[i]
+		if part.Parent then
+			-- only move if the toy is out of grab range
+			if (part.Position - root.Position).Magnitude > 30 then
+				root.CFrame = part.CFrame * CFrame.new(0, 4, 0)
+				teleported = true
+				task.wait(0.08)
+			end
+			if claim(part) then
+				addToy(part, #claimed + 1)
+			end
+		end
+	end
+	if teleported then root.CFrame = origin end
+
+	if #claimed == 0 then
+		S.busy = false
+		setStatus("no toys claimed")
+		return
+	end
+
+	-- take off ahead of you, up in the air
+	local look = root.CFrame.LookVector
+	local flat = Vector3.new(look.X, 0, look.Z)
+	flat = flat.Magnitude > 1e-3 and flat.Unit or V(0, 0, -1)
+	pos = root.Position + flat * 50 + V(0, 35, 0)
+	vel = Vector3.zero
+	fwd = flat
+	pitch, bank = 0, 0
+	morph = (S.mode == "plane") and 1 or 0
+	autoTarget = nil
+
+	camPart = Instance.new("Part")
+	camPart.Name = "UFOCam"
+	camPart.Anchored = true
+	camPart.CanCollide = false
+	camPart.CanQuery = false
+	camPart.CanTouch = false
+	camPart.Transparency = 1
+	camPart.Size = V(1, 1, 1)
+	camPart.CFrame = CFrame.new(pos)
+	camPart.Parent = workspace
+
+	if S.skin then buildSkin() end
+
+	S.active = true
+	buildBtn.Text = "Dismiss"
+	setStatus(("flying (%d toys)"):format(#claimed))
+	heartbeat = RunService.Heartbeat:Connect(step)
+	S.busy = false
+end
+
+----------------------------------------------------------------
+-- Controls
+----------------------------------------------------------------
+buildBtn = makeButton("Summon", 10, 24, 180, 30, function()
+	if S.active then release() else task.spawn(build) end
+end)
+
+modeBtn = makeButton("Mode: UFO", 10, 58, 88, 30, function()
+	setMode(S.mode == "ufo" and "plane" or "ufo")
+end)
+
+autoBtn = makeButton("Auto: OFF", 102, 58, 88, 30, function(b)
+	S.auto = not S.auto
+	b.Text = "Auto: " .. (S.auto and "ON" or "OFF")
+	b.BackgroundColor3 = S.auto and Color3.fromRGB(70, 110, 200) or Color3.fromRGB(52, 52, 66)
+	autoTarget = nil
+	if S.active then setStatus(S.auto and "autopilot" or "manual flight") end
+end)
+
+makeHoldButton("▲ Up", 10, 92, 88, 28, function(h) S.upHeld = h end)
+makeHoldButton("▼ Down", 102, 92, 88, 28, function(h) S.downHeld = h end)
+
+local speedLabel = makeLabel("Speed: 60", 10, 124, 90)
+makeButton("-", 104, 124, 40, 28, function()
+	S.speed = math.max(20, S.speed - 10)
+	speedLabel.Text = "Speed: " .. S.speed
+end)
+makeButton("+", 150, 124, 40, 28, function()
+	S.speed = math.min(250, S.speed + 10)
+	speedLabel.Text = "Speed: " .. S.speed
+end)
+
+local sizeLabel = makeLabel("Size: 6", 10, 154, 90)
+local function changeSize(delta)
+	S.size = math.clamp(S.size + delta, 3, 12)
+	sizeLabel.Text = "Size: " .. S.size
+	if S.active and S.skin then buildSkin() end -- rebuilt at the new size
+end
+makeButton("-", 104, 154, 40, 28, function() changeSize(-1) end)
+makeButton("+", 150, 154, 40, 28, function() changeSize(1) end)
+
+makeButton("Beam: ON", 10, 186, 88, 28, function(b)
+	S.beam = not S.beam
+	b.Text = "Beam: " .. (S.beam and "ON" or "OFF")
+end)
+makeButton("Ride: OFF", 102, 186, 88, 28, function(b)
+	S.ride = not S.ride
+	b.Text = "Ride: " .. (S.ride and "ON" or "OFF")
+end)
+
+makeButton("Skin: ON", 10, 218, 88, 28, function(b)
+	S.skin = not S.skin
+	b.Text = "Skin: " .. (S.skin and "ON" or "OFF")
+	if S.active then
+		if S.skin then buildSkin() else destroySkin() end
+	end
+end)
+makeButton("Cam: Follow", 102, 218, 88, 28, function(b)
+	S.camUFO = not S.camUFO
+	b.Text = "Cam: " .. (S.camUFO and "Follow" or "Me")
+end)
+
+makeButton("Indestructible: ON", 10, 250, 180, 28, function(b)
+	S.safe = not S.safe
+	b.Text = "Indestructible: " .. (S.safe and "ON" or "OFF")
+	b.BackgroundColor3 = S.safe and Color3.fromRGB(60, 130, 80) or Color3.fromRGB(52, 52, 66)
+end).BackgroundColor3 = Color3.fromRGB(60, 130, 80)
+
+-- PC keys: Space = up, Shift = down, M = switch mode
+table.insert(conns, UIS.InputBegan:Connect(function(input, gpe)
+	if gpe then return end
+	if input.KeyCode == Enum.KeyCode.Space then S.upHeld = true
+	elseif input.KeyCode == Enum.KeyCode.LeftShift then S.downHeld = true
+	elseif input.KeyCode == Enum.KeyCode.M then setMode(S.mode == "ufo" and "plane" or "ufo") end
+end))
+table.insert(conns, UIS.InputEnded:Connect(function(input)
+	if input.KeyCode == Enum.KeyCode.Space then S.upHeld = false
+	elseif input.KeyCode == Enum.KeyCode.LeftShift then S.downHeld = false end
+end))
+
+-- Close / unload
+local function unload()
+	S.dead = true
+	release()
+	for _, c in ipairs(conns) do c:Disconnect() end
+	conns = {}
+	if gui then gui:Destroy() end
+	env.FTAPUfoUnload = nil
+end
+env.FTAPUfoUnload = unload
+
+local close = Instance.new("TextButton")
+close.Size = UDim2.fromOffset(24, 24)
+close.Position = UDim2.new(1, -30, 0, 4)
+close.BackgroundColor3 = Color3.fromRGB(150, 50, 50)
+close.Text = "X"
+close.TextColor3 = Color3.new(1, 1, 1)
+close.Font = Enum.Font.GothamBold
+close.TextSize = 12
+close.BorderSizePixel = 0
+close.Parent = main
+Instance.new("UICorner", close).CornerRadius = UDim.new(0, 6)
+close.MouseButton1Click:Connect(unload)
+
+local mini = Instance.new("TextButton")
+mini.Size = UDim2.fromOffset(24, 24)
+mini.Position = UDim2.new(1, -58, 0, 4)
+mini.BackgroundColor3 = Color3.fromRGB(52, 52, 66)
+mini.Text = "-"
+mini.TextColor3 = Color3.new(1, 1, 1)
+mini.Font = Enum.Font.GothamBold
+mini.TextSize = 14
+mini.BorderSizePixel = 0
+mini.Parent = main
+Instance.new("UICorner", mini).CornerRadius = UDim.new(0, 6)
+local minimized = false
+mini.MouseButton1Click:Connect(function()
+	minimized = not minimized
+	body.Visible = not minimized
+	main.Size = minimized and UDim2.fromOffset(200, 32) or UDim2.fromOffset(200, GUI_H)
+	mini.Text = minimized and "+" or "-"
+end)
+
+-- Dragging (kept on screen)
+do
+	local dragging, dragStart, startPos
+	title.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1
+			or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = true
+			dragStart = input.Position
+			startPos = main.Position
+		end
+	end)
+	table.insert(conns, UIS.InputChanged:Connect(function(input)
+		if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+			or input.UserInputType == Enum.UserInputType.Touch) then
+			local d = input.Position - dragStart
+			local vp = gui.AbsoluteSize
+			local nx = math.clamp(startPos.X.Offset + d.X, 0, math.max(0, vp.X - main.AbsoluteSize.X))
+			local ny = math.clamp(startPos.Y.Offset + d.Y, 0, math.max(0, vp.Y - 40))
+			main.Position = UDim2.new(0, nx, 0, ny)
+		end
+	end))
+	table.insert(conns, UIS.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1
+			or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = false
+		end
+	end))
+end

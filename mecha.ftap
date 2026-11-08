@@ -1,0 +1,1816 @@
+ref = "F" },
+	{ id = "cannon", pref = "L" },
+}
+
+-- CAR form (units, origin on the ground under the center, nose = -Z): pos, long dir, flat normal
+local X, Y, Z = V(1, 0, 0), V(0, 1, 0), V(0, 0, 1)
+local CAR = {
+	chest = { V(0, 1.55, -2.9), X, Y }, back = { V(0, 1.55, 3.2), X, Y },
+	spine = { V(0, 0.95, 0), Z, Y }, hipP = { V(0, 2.78, 0.5), X, Y },
+	mask = { V(0, 2.2, -1.4), X, V(0, 0.8, -0.6) },
+	padL = { V(-2.05, 1.6, 0.5), Z, V(-1, 0, 0) }, padR = { V(2.05, 1.6, 0.5), Z, V(1, 0, 0) },
+	thighL = { V(-1.95, 0.6, 0), Z, V(-1, 0, 0) }, thighR = { V(1.95, 0.6, 0), Z, V(1, 0, 0) },
+	shinL = { V(0, 0.85, -2.9), X, Y }, shinR = { V(0, 0.85, 2.9), X, Y },
+	uarmL = { V(0, 0.9, -4.65), X, Y }, uarmR = { V(0, 0.9, 4.65), X, Y },
+	farmL = { V(-1.7, 2.85, 0.5), Z, Y }, farmR = { V(1.7, 2.85, 0.5), Z, Y },
+	cannon = { V(0, 2.45, 4.3), X, Y },
+}
+-- the 4 wheels use the foot + fist plank toys
+local WHEEL = {
+	footL = V(-2.15, 0.85, -2.9), footR = V(2.15, 0.85, -2.9),
+	fistL = V(-2.15, 0.85, 2.9), fistR = V(2.15, 0.85, 2.9),
+}
+
+-- JET form (nose = -Z, wings along X)
+local JET = {
+	chest = { V(0, 1.95, -2.2), Z, Y }, back = { V(0, 2.1, 1.8), Z, Y },
+	spine = { V(0, 1.5, 0), Z, Y }, hipP = { V(0, 1.5, 0.6), X, Y },
+	mask = { V(0, 1.95, -3.4), X, V(0, 1, -0.5) },
+	padL = { V(-3.2, 1.45, 0.9), X, Y }, padR = { V(3.2, 1.45, 0.9), X, Y },
+	thighL = { V(-0.95, 1.25, 2.2), Z, Y }, thighR = { V(0.95, 1.25, 2.2), Z, Y },
+	shinL = { V(-3.0, 1.5, 0.5), X, Y }, shinR = { V(3.0, 1.5, 0.5), X, Y },
+	uarmL = { V(-1.0, 2.4, 3.7), V(-0.4, 0.9, 0.2), V(-1, 0, 0) },
+	uarmR = { V(1.0, 2.4, 3.7), V(0.4, 0.9, 0.2), V(1, 0, 0) },
+	farmL = { V(-2.4, 1.0, -0.2), Z, Y }, farmR = { V(2.4, 1.0, -0.2), Z, Y },
+	footL = { V(-1.6, 1.5, 4.0), X, Y }, footR = { V(1.6, 1.5, 4.0), X, Y },
+	fistL = { V(-5.1, 1.8, 1.7), Y, V(-1, 0, 0) }, fistR = { V(5.1, 1.8, 1.7), Y, V(1, 0, 0) },
+	cannon = { V(0, 1.5, -4.7), Z, Y },
+}
+
+----------------------------------------------------------------
+-- Toys: shape classification + rigid constraints
+----------------------------------------------------------------
+local function getToyFolder()
+	return workspace:FindFirstChild(lp.Name .. "SpawnedInToys")
+		or workspace:FindFirstChild("Ketik_Ketikketik4SpawnedInToys")
+end
+
+local function getToyParts()
+	local parts = {}
+	local folder = getToyFolder()
+	if not folder then return parts end
+	for _, toy in ipairs(folder:GetChildren()) do
+		local sp = toy:FindFirstChild("SoundPart")
+		if sp and sp:IsA("BasePart") then
+			table.insert(parts, sp)
+			if #parts >= MAX_TOYS then break end
+		end
+	end
+	return parts
+end
+
+local function claim(part)
+	-- The remote name/arguments may change when the game updates.
+	return pcall(function()
+		RS.GrabEvents.SetNetworkOwner:FireServer(part, part.CFrame)
+	end)
+end
+
+local function ownsPart(part)
+	if isnetworkowner then
+		local ok, r = pcall(isnetworkowner, part)
+		if ok then return r end
+	end
+	return false
+end
+
+-- "L" = ladder-like (long + narrow), "F" = flat plank
+local function classify(part)
+	local s = part.Size
+	local dims = { { s.X, 1 }, { s.Y, 2 }, { s.Z, 3 } }
+	table.sort(dims, function(a, b) return a[1] > b[1] end)
+	local L, M, T = dims[1][1], dims[2][1], dims[3][1]
+	local kind = "F"
+	if L / math.max(M, 1e-3) >= 2.2 then
+		kind = "L"
+	elseif T / math.max(M, 1e-3) > 0.5 and L / math.max(T, 1e-3) >= 3 then
+		kind = "L"
+	end
+	return { part = part, kind = kind, aL = dims[1][2], aM = dims[2][2], aT = dims[3][2], len = L }
+end
+
+local function assign(parts)
+	local Ls, Fs = {}, {}
+	for _, p in ipairs(parts) do
+		local info = classify(p)
+		table.insert(info.kind == "L" and Ls or Fs, info)
+	end
+	table.sort(Ls, function(a, b) return a.len > b.len end)
+	table.sort(Fs, function(a, b) return a.len > b.len end)
+	local result, open = {}, {}
+	for si, slot in ipairs(SLOTS) do
+		local list = (slot.pref == "L") and Ls or Fs
+		if #list > 0 then
+			result[si] = table.remove(list, 1)
+		else
+			table.insert(open, si)
+		end
+	end
+	for _, si in ipairs(open) do
+		result[si] = table.remove(Ls, 1) or table.remove(Fs, 1)
+	end
+	return result
+end
+
+local function makeMovers(c)
+	local part = c.part
+	if not (c.att and c.att.Parent == part) then
+		if c.att then c.att:Destroy() end
+		local att = Instance.new("Attachment")
+		att.Name = "MechaAtt"
+		att.Parent = part
+		c.att = att
+		c.ap, c.ao = nil, nil
+	end
+	if not (c.ap and c.ap.Parent == part) then
+		local ap = Instance.new("AlignPosition")
+		ap.Mode = Enum.PositionAlignmentMode.OneAttachment
+		ap.Attachment0 = c.att
+		ap.RigidityEnabled = true
+		ap.Position = part.Position
+		ap.Parent = part
+		c.ap = ap
+	end
+	if not (c.ao and c.ao.Parent == part) then
+		local ao = Instance.new("AlignOrientation")
+		ao.Mode = Enum.OrientationAlignmentMode.OneAttachment
+		ao.Attachment0 = c.att
+		ao.RigidityEnabled = true
+		ao.CFrame = part.CFrame.Rotation
+		ao.Parent = part
+		c.ao = ao
+	end
+end
+
+local function addToy(info, si)
+	local part = info.part
+	local c = {
+		part = part, si = si, id = SLOTS[si].id, oldCollide = part.CanCollide,
+		kind = info.kind, aL = info.aL, aM = info.aM, aT = info.aT, len = info.len,
+	}
+	part.CanCollide = false
+	makeMovers(c)
+	table.insert(claimed, c)
+	claimedSet[part] = c
+	return c
+end
+
+local function refill()
+	for i = #claimed, 1, -1 do
+		local c = claimed[i]
+		if not c.part.Parent then
+			claimedSet[c.part] = nil
+			table.remove(claimed, i)
+		end
+	end
+	if #claimed >= #SLOTS then return end
+	local used = {}
+	for _, c in ipairs(claimed) do used[c.si] = true end
+	local fresh = {}
+	for _, part in ipairs(getToyParts()) do
+		if not claimedSet[part] then table.insert(fresh, classify(part)) end
+	end
+	for si = 1, #SLOTS do
+		if not used[si] and #fresh > 0 then
+			local pick = 1
+			for i, info in ipairs(fresh) do
+				if info.kind == SLOTS[si].pref then pick = i break end
+			end
+			local info = table.remove(fresh, pick)
+			if claim(info.part) then
+				used[si] = true
+				addToy(info, si)
+			end
+		end
+	end
+end
+
+-- a size where a thigh is about as long as your ladders
+local function fitSize()
+	local total, n = 0, 0
+	for _, c in ipairs(claimed) do
+		if c.kind == "L" then
+			total += c.len
+			n += 1
+		end
+	end
+	if n == 0 then
+		for _, c in ipairs(claimed) do
+			total += c.len
+			n += 1
+		end
+	end
+	if n == 0 then return nil end
+	return math.clamp(math.floor(total / n / 1.9 + 0.5), 3, MAX_SIZE)
+end
+
+----------------------------------------------------------------
+-- MECH rig (body space: units, origin on the ground under the pelvis,
+-- +x right, +y up, -z forward)
+----------------------------------------------------------------
+local THIGH, UARM = 1.9, 1.75
+local PELV_Y = 3.55
+local HIP_W, SH_W = 0.95, 1.7
+
+local D1 = { -- robot dance: arm poses (hand rel shoulder, torso frame), one per beat
+	{ V(0.9, 1.6, -0.7), V(-0.9, -0.9, -1.0) },
+	{ V(0.9, 0.2, -2.2), V(-0.9, 1.6, -0.7) },
+	{ V(2.9, 0.2, -0.5), V(-2.9, 0.2, -0.5) },
+	{ V(0.3, 0.0, -2.6), V(-0.3, 0.0, -2.6) },
+}
+
+local function computeMech(t, dt, att)
+	local rb = runBlend
+	local w = smooth(speedNow / 3)
+	local Aeff = lerp(0.95, 1.5, rb) -- half stride
+	local d = lerp(0.62, 0.45, rb)
+	local A, Hh = Aeff * w, lerp(0.45, 0.9, rb) * w
+	lastPhase = phase
+	if speedNow > 0.4 then
+		phase = (phase + dt * math.pi * d * speedNow / (Aeff * S.size)) % TAU
+	end
+	local stompL = speedNow > 3 and phase < lastPhase
+	local stompR = speedNow > 3 and lastPhase < math.pi and phase >= math.pi
+
+	local function foot(ph)
+		local u = (ph / TAU) % 1
+		if u < d then
+			local tt = u / d
+			local heel = math.clamp((tt - 0.75) / 0.25, 0, 1)
+			return A * (1 - 2 * tt), 0, -0.5 * heel * w
+		else
+			local tt = (u - d) / (1 - d)
+			local e = (1 - math.cos(math.pi * tt)) / 2
+			local si = math.sin(math.pi * tt)
+			return -A + 2 * A * e, Hh * si, 0.3 * si * w
+		end
+	end
+	local sL, lL, pL = foot(phase)
+	local sR, lR, pR = foot(phase + math.pi)
+
+	if att and att.stW and att.stW > 0 then
+		local fl = (att.front == "L") and 1.0 or -1.0
+		sL, sR = lerp(sL, fl, att.stW), lerp(sR, -fl, att.stW)
+		lL, lR = lerp(lL, 0, att.stW), lerp(lR, 0, att.stW)
+		pL, pR = lerp(pL, 0, att.stW), lerp(pR, 0, att.stW)
+	end
+
+	-- heavy gait: small bob, sway over the stance leg, counter-twist
+	local pelvisY = PELV_Y + lerp(0.08, -0.2, rb) * w * math.cos(2 * (phase - math.pi * d))
+	local sway = lerp(0.25, 0.14, rb) * w * -math.cos(phase - math.pi * d)
+	local pelvisYaw = -0.10 * w * math.cos(phase)
+	local torsoYaw = 0.14 * w * math.cos(phase)
+	local lean = 0.02 + lerp(0.04, 0.28, rb) * w
+	local tRoll = 0
+	local headYaw = math.clamp(yawRate * 0.3, -0.6, 0.6)
+	local headPitch, headRoll = 0, 0
+	pelvisY += math.sin(t * 1.4) * 0.03 * (1 - w)
+
+	local beat = t * 2 -- 120 bpm
+	local bi, bf = math.floor(beat) % 4, beat % 1
+	local snap = smooth(math.min(bf * 2.5, 1))
+	local pb = math.pi * beat
+
+	-- dance 1 (robot)
+	if d1W > 0.001 then
+		pelvisY = lerp(pelvisY, PELV_Y - 0.3 + 0.25 * math.abs(math.sin(pb)), d1W)
+		sway = lerp(sway, 0.35 * math.sin(pb), d1W)
+		pelvisYaw = lerp(pelvisYaw, 0.25 * math.sin(pb), d1W)
+		torsoYaw = lerp(torsoYaw, -0.3 * math.sin(pb), d1W)
+		headYaw = lerp(headYaw, ((bi % 2 == 0) and 0.5 or -0.5) * snap, d1W)
+		sL, sR = lerp(sL, 0, d1W), lerp(sR, 0, d1W)
+		lL = lerp(lL, 0.6 * math.max(0, math.sin(pb)), d1W)
+		lR = lerp(lR, 0.6 * math.max(0, -math.sin(pb)), d1W)
+	end
+	-- dance 2 (disco point)
+	if d2W > 0.001 then
+		pelvisY = lerp(pelvisY, PELV_Y - 0.35 + 0.3 * math.abs(math.sin(pb)), d2W)
+		sway = lerp(sway, 0.45 * math.sin(pb * 0.5), d2W)
+		pelvisYaw = lerp(pelvisYaw, 0.4 * math.sin(pb * 0.5), d2W)
+		torsoYaw = lerp(torsoYaw, -0.35 * math.sin(pb * 0.5), d2W)
+		tRoll = lerp(tRoll, 0.12 * math.sin(pb * 0.5), d2W)
+		headPitch = lerp(headPitch, 0.12 * math.sin(pb * 2), d2W)
+		sL, sR = lerp(sL, 0, d2W), lerp(sR, 0, d2W)
+		lL = lerp(lL, 0.5 * math.max(0, math.sin(pb * 0.5)), d2W)
+		lR = lerp(lR, 0.5 * math.max(0, -math.sin(pb * 0.5)), d2W)
+	end
+	-- bored: slouch, weight shift, foot tapping, looking around
+	if boredW > 0.001 then
+		pelvisY = lerp(pelvisY, PELV_Y - 0.12, boredW)
+		sway = lerp(sway, 0.3 * math.sin(t * 0.5), boredW)
+		lean = lerp(lean, 0.18 + 0.05 * math.sin(t * 0.8), boredW)
+		tRoll = lerp(tRoll, 0.07, boredW)
+		headYaw = lerp(headYaw, 0.6 * math.sin(t * 0.45), boredW)
+		headPitch = lerp(headPitch, -0.15 + 0.1 * math.sin(t * 0.9), boredW)
+		headRoll = lerp(headRoll, 0.18, boredW)
+		lR = lerp(lR, 0.25 * math.max(0, math.sin(t * 6)), boredW)
+	end
+	-- hand: waving hello
+	if handW > 0.001 then
+		lean = lerp(lean, -0.04, handW)
+		headRoll = lerp(headRoll, 0.12, handW)
+		headYaw = lerp(headYaw, 0.2, handW)
+		pelvisY = lerp(pelvisY, PELV_Y - 0.05 * math.abs(math.sin(t * 3)), handW)
+	end
+	-- sit on the ground
+	if sitW > 0.001 then
+		pelvisY = lerp(pelvisY, 0.75, sitW)
+		sway = lerp(sway, 0, sitW)
+		pelvisYaw = lerp(pelvisYaw, 0, sitW)
+		torsoYaw = lerp(torsoYaw, 0, sitW)
+		lean = lerp(lean, 0.1 + 0.03 * math.sin(t * 1.4), sitW)
+		headYaw = lerp(headYaw, 0.3 * math.sin(t * 0.4), sitW)
+		pL, pR = lerp(pL, 0, sitW), lerp(pR, 0, sitW)
+	end
+	-- kneel on one knee (bow)
+	if kneelW > 0.001 then
+		pelvisY = lerp(pelvisY, 2.1, kneelW)
+		sway = lerp(sway, 0, kneelW)
+		pelvisYaw = lerp(pelvisYaw, 0, kneelW)
+		torsoYaw = lerp(torsoYaw, 0, kneelW)
+		lean = lerp(lean, 0.3, kneelW)
+		headPitch = lerp(headPitch, -0.4, kneelW)
+		pL, pR = lerp(pL, 0, kneelW), lerp(pR, 0, kneelW)
+	end
+	if att then
+		pelvisY += (att.pY or 0)
+		pelvisYaw += att.pYaw or 0
+		torsoYaw += att.tYaw or 0
+		lean += att.lean or 0
+	end
+
+	local pelvisRot = CFrame.Angles(0, pelvisYaw, 0)
+	local torsoRot = CFrame.Angles(0, torsoYaw, 0) * CFrame.Angles(-lean, 0, 0) * CFrame.Angles(0, 0, tRoll)
+
+	local J = { pelvisRot = pelvisRot, torsoRot = torsoRot, stompL = stompL, stompR = stompR }
+	local pelvis = V(sway, pelvisY, 0)
+	J.pelvis = pelvis
+	J.chest = pelvis + torsoRot * V(0, 2.0, 0)
+	J.neck = pelvis + torsoRot * V(0, 2.75, 0)
+	J.shL = J.chest + torsoRot * V(-SH_W, 0.35, 0)
+	J.shR = J.chest + torsoRot * V(SH_W, 0.35, 0)
+	J.hipL = pelvis + pelvisRot * V(-HIP_W, 0, 0)
+	J.hipR = pelvis + pelvisRot * V(HIP_W, 0, 0)
+
+	-- head + mask (the mask is hinged on the forehead and flips up and back)
+	J.headRot = torsoRot * CFrame.Angles(0, headYaw, 0) * CFrame.Angles(headPitch, 0, 0) * CFrame.Angles(0, 0, headRoll)
+	J.headC = J.neck + torsoRot * V(0, 0.75, 0)
+	local hingeL, closedL = V(0, 0.55, -0.55), V(0, -0.05, -0.7)
+	local mRot = CFrame.Angles(-1.95 * maskW, 0, 0)
+	J.maskRot = J.headRot * mRot
+	J.maskPos = J.headC + J.headRot * (hingeL + mRot * (closedL - hingeL))
+	J.hinge = J.headC + J.headRot * hingeL
+
+	-- legs ----------------------------------------------------------
+	local function ankle(side, s, lift)
+		local a = V(side * 1.0, 0.3 + lift, -s)
+		if sitW > 0 then a = a:Lerp(V(side * 1.0, 0.35, -3.1), sitW) end
+		if kneelW > 0 then
+			a = a:Lerp((side < 0) and V(-1.0, 0.35, -2.3) or V(1.0, 0.45, 1.8), kneelW)
+		end
+		return a
+	end
+	J.ankL, J.ankR = ankle(-1, sL, lL), ankle(1, sR, lR)
+	local function pole(side)
+		local p = V(0, 0.15, -1)
+		p = p:Lerp(V(0, 1, -0.2), sitW)
+		if side < 0 then
+			p = p:Lerp(V(0, 0.3, -1), kneelW)
+		else
+			p = p:Lerp(V(0, -1, -0.2), kneelW)
+		end
+		return pelvisRot * p
+	end
+	J.kneeL = ik(J.hipL, J.ankL, pole(-1), THIGH)
+	J.kneeR = ik(J.hipR, J.ankR, pole(1), THIGH)
+	if kneelW > 0.01 then
+		J.kneeR = V(J.kneeR.X, math.max(J.kneeR.Y, 0.35), J.kneeR.Z)
+	end
+	local function toe(ank, pt)
+		return ank + pelvisRot * V(0, 0.8 * math.sin(pt) - 0.12, -0.9 * math.cos(pt))
+	end
+	J.toeL = toe(J.ankL, pL)
+	J.toeR = toe(J.ankR, (kneelW > 0.5) and (pR - 1.2 * kneelW) or pR)
+
+	-- arms ----------------------------------------------------------
+	local reach = (UARM * 2) * lerp(0.95, 0.62, rb)
+	local swing = lerp(0.35, 0.8, rb) * w * math.cos(phase)
+	local function locoHand(sh, side)
+		local th = ((side < 0) and -swing or swing) + 0.03 * math.sin(t * 1.4 + side)
+		return sh + torsoRot * (V(side * 0.3, -math.cos(th), -math.sin(th)) * reach)
+	end
+	local hL, hR = locoHand(J.shL, -1), locoHand(J.shR, 1)
+
+	if att and att.armW and att.armW > 0 then
+		if att.hR then hR = hR:Lerp(J.shR + torsoRot * att.hR, att.armW) end
+		if att.hL then hL = hL:Lerp(J.shL + torsoRot * att.hL, att.armW) end
+	end
+	if d1W > 0.001 then
+		local p0, p1 = D1[bi + 1], D1[(bi + 1) % 4 + 1]
+		hR = hR:Lerp(J.shR + torsoRot * p0[1]:Lerp(p1[1], snap), d1W)
+		hL = hL:Lerp(J.shL + torsoRot * p0[2]:Lerp(p1[2], snap), d1W)
+	end
+	if d2W > 0.001 then
+		local upPose, downPose = V(1.9, 2.8, -0.3), V(-0.6, -3.0, -1.0)
+		local even = (math.floor(beat) % 2 == 0)
+		local cur, prev = even and upPose or downPose, even and downPose or upPose
+		hR = hR:Lerp(J.shR + torsoRot * prev:Lerp(cur, snap), d2W)
+		hL = hL:Lerp(J.shL + torsoRot * V(-1.7, -1.0, -0.1), d2W)
+	end
+	if boredW > 0.001 then
+		local scratch = 0.12 * math.sin(t * 5)
+		hR = hR:Lerp(J.shR + torsoRot * V(0.2 + scratch, 1.0, -1.4), boredW) -- hand to the head
+		hL = hL:Lerp(J.shL + torsoRot * V(-1.7, -1.0, -0.2), boredW) -- other hand on the hip
+	end
+	if handW > 0.001 then
+		hR = hR:Lerp(J.shR + torsoRot * V(0.9 + 0.8 * math.sin(t * 7), 3.0, -0.5), handW)
+		hL = hL:Lerp(J.shL + torsoRot * V(-1.7, -1.0, -0.2), handW)
+	end
+	if sitW > 0.001 then
+		hR = hR:Lerp(J.kneeR + V(0.1, 0.55, 0.1), sitW)
+		hL = hL:Lerp(J.kneeL + V(-0.1, 0.55, 0.1), sitW)
+	end
+	if kneelW > 0.001 then
+		hR = hR:Lerp(V(1.4, 0.5, -1.2), kneelW) -- fist planted on the ground
+		hL = hL:Lerp(J.kneeL + V(-0.1, 0.55, 0.1), kneelW)
+	end
+	local maxLen = UARM * 2 * 0.999
+	hR, hL = clampReach(J.shR, hR, maxLen), clampReach(J.shL, hL, maxLen)
+	J.elbL = ik(J.shL, hL, torsoRot * V(-0.35, -0.4, 1.0), UARM)
+	J.elbR = ik(J.shR, hR, torsoRot * V(0.35, -0.4, 1.0), UARM)
+	J.handL, J.handR = hL, hR
+
+	-- backpack cannon (diagonal on the right shoulder)
+	J.cannonPos = J.chest + torsoRot * V(1.0, 1.1, 1.05)
+	J.cannonDir = torsoRot * V(0.15, 0.75, -0.55)
+	return J
+end
+
+-- slot target for the MECH form: pos (units), long dir, flat normal
+local function mechTarget(id, J)
+	local tr, pr = J.torsoRot, J.pelvisRot
+	local fwd, right, up = tr * V(0, 0, -1), tr * V(1, 0, 0), tr * V(0, 1, 0)
+	if id == "chest" then return J.chest + fwd * 0.95, right, fwd
+	elseif id == "back" then return J.chest - fwd * 1.3 + up * 0.1, right, -fwd
+	elseif id == "spine" then return (J.pelvis + J.chest) / 2, J.chest - J.pelvis, fwd
+	elseif id == "hipP" then return J.pelvis + pr * V(0, 0.1, -0.75), J.hipR - J.hipL, pr * V(0, 0, -1)
+	elseif id == "mask" then return J.maskPos, J.maskRot * V(1, 0, 0), J.maskRot * V(0, 0, -1)
+	elseif id == "cannon" then return J.cannonPos, J.cannonDir, right
+	end
+	local side = id:sub(-1)
+	local s = (side == "L") and -1 or 1
+	local key = id:sub(1, -2)
+	if key == "pad" then
+		return J["sh" .. side] + up * 0.6 + right * (s * 0.4), fwd, up * 0.8 + right * (s * 0.6)
+	elseif key == "thigh" then
+		local a, b = J["hip" .. side], J["knee" .. side]
+		return (a + b) / 2, b - a, pr * V(0, 0, -1)
+	elseif key == "shin" then
+		local a, b = J["knee" .. side], J["ank" .. side]
+		return (a + b) / 2, b - a, pr * V(0, 0, -1)
+	elseif key == "uarm" then
+		local a, b = J["sh" .. side], J["elb" .. side]
+		return (a + b) / 2, b - a, right * s
+	elseif key == "farm" then
+		local a, b = J["elb" .. side], J["hand" .. side]
+		return (a + b) / 2, b - a, right * s
+	elseif key == "foot" then
+		local a, b = J["ank" .. side], J["toe" .. side]
+		return (a + b) / 2 + V(0, -0.1, 0), b - a, V(0, 1, 0)
+	else -- fist
+		local a, b = J["elb" .. side], J["hand" .. side]
+		local dir = b - a
+		return b + (dir.Magnitude > 1e-3 and dir.Unit or V(0, -1, 0)) * 0.4, dir, right * s
+	end
+end
+
+local function formTarget(form, id, J)
+	if form == "mech" then return mechTarget(id, J) end
+	if form == "car" then
+		local wp = WHEEL[id]
+		if wp then
+			local side = (id == "footL" or id == "fistL") and -1 or 1
+			local st = (id == "footL" or id == "footR") and steer or 0
+			local d0 = V(0, math.sin(wheelA), math.cos(wheelA))
+			return wp, V(d0.Z * math.sin(st), d0.Y, d0.Z * math.cos(st)),
+				V(side * math.cos(st), 0, -side * math.sin(st))
+		end
+		local e = CAR[id]
+		return e[1], e[2], e[3]
+	end
+	local e = JET[id]
+	return e[1], e[2], e[3]
+end
+
+----------------------------------------------------------------
+-- Skills (mech): punch + slam. Same keyframe scheme as the stickman.
+----------------------------------------------------------------
+local function skillPunch(p, a)
+	local s = a.side
+	local att = { moveMul = 0, lockFace = true, front = (s > 0) and "L" or "R" }
+	att.armW = track(p, { { 0, 0 }, { 0.12, 1 }, { 0.8, 1 }, { 1, 0 } })
+	local hit, pull, rest = V(s * 0.3, -0.1, -3.3), V(s * 0.4, -0.9, 1.0), V(s * 0.4, -0.8, -0.9)
+	local mine = track(p, { { 0, pull }, { 0.28, pull }, { 0.4, hit }, { 0.52, hit }, { 0.8, rest }, { 1, rest } })
+	local guard = V(-s * 0.5, -0.8, -1.3)
+	if s > 0 then att.hR, att.hL = mine, guard else att.hL, att.hR = mine, guard end
+	att.tYaw = -s * track(p, { { 0, 0 }, { 0.28, 0.5 }, { 0.4, -0.45 }, { 0.52, -0.45 }, { 1, 0 } })
+	att.pYaw = att.tYaw * 0.6
+	att.lean = track(p, { { 0, 0 }, { 0.28, -0.08 }, { 0.4, 0.28 }, { 0.6, 0.28 }, { 1, 0 } })
+	att.pY = -track(p, { { 0, 0 }, { 0.28, 0.12 }, { 0.4, 0.4 }, { 0.7, 0.25 }, { 1, 0 } })
+	att.stW = track(p, { { 0, 0 }, { 0.15, 1 }, { 0.85, 1 }, { 1, 0 } })
+	att.rootVel = moveProfile(p, 0.25, 0.5, 1.4 * S.size, a.dur)
+	att.fx = { p = 0.42, kind = "punch", hand = (s > 0) and "handR" or "handL" }
+	return att
+end
+
+local function skillSlam(p, a)
+	local att = { moveMul = 0, lockFace = true, front = "L" }
+	att.armW = track(p, { { 0, 0 }, { 0.15, 1 }, { 0.85, 1 }, { 1, 0 } })
+	local upR, upL = V(0.6, 3.1, 0.4), V(-0.6, 3.1, 0.4)
+	local hitR, hitL = V(0.7, -0.8, -3.1), V(-0.7, -0.8, -3.1)
+	att.hR = track(p, { { 0, upR }, { 0.4, upR }, { 0.52, hitR }, { 1, hitR } })
+	att.hL = track(p, { { 0, upL }, { 0.4, upL }, { 0.52, hitL }, { 1, hitL } })
+	att.lean = track(p, { { 0, 0 }, { 0.4, -0.25 }, { 0.52, 0.95 }, { 0.8, 0.95 }, { 1, 0 } })
+	att.pY = track(p, { { 0, 0 }, { 0.4, 0.2 }, { 0.52, -1.7 }, { 0.8, -1.6 }, { 1, 0 } })
+	att.stW = track(p, { { 0, 0 }, { 0.2, 1 }, { 0.85, 1 }, { 1, 0 } })
+	att.rootVel = moveProfile(p, 0.45, 0.6, 0.9 * S.size, a.dur)
+	att.fx = { p = 0.54, kind = "slam" }
+	return att
+end
+
+local SKILLS = {
+	punch = { dur = 0.85, fn = skillPunch },
+	slam = { dur = 1.7, fn = skillSlam },
+}
+
+----------------------------------------------------------------
+-- SKIN: detailed models (client-side parts, only you see them)
+----------------------------------------------------------------
+local WHITE = Color3.fromRGB(215, 220, 230)
+local REDC = Color3.fromRGB(205, 45, 45)
+local JOINT = Color3.fromRGB(55, 60, 72)
+local NEON = Color3.fromRGB(80, 230, 255)
+
+local function mk(parent, shape, size, cf, color, material, transparency)
+	local p = Instance.new("Part")
+	p.Anchored = true
+	p.CanCollide = false
+	p.CanQuery = false
+	p.CanTouch = false
+	p.Massless = true
+	p.CastShadow = false
+	if shape then p.Shape = shape end
+	p.Size = size
+	p.CFrame = cf
+	p.Color = color
+	p.Material = material
+	p.Transparency = transparency or 0
+	p.Parent = parent
+	return p
+end
+
+local function newModel(parent, name)
+	local m = Instance.new("Model")
+	m.Name = name
+	local root = mk(m, nil, V(0.2, 0.2, 0.2), CFrame.new(), Color3.new(), Enum.Material.SmoothPlastic, 1)
+	m.PrimaryPart = root
+	m.Parent = parent
+	return m
+end
+
+local function bx(parent, color, mat, tr) return mk(parent, nil, V(1, 1, 1), CFrame.new(), color, mat or Enum.Material.Metal, tr) end
+local function cl(parent, color, mat) return mk(parent, Enum.PartType.Cylinder, V(1, 1, 1), CFrame.new(), color, mat or Enum.Material.Metal) end
+local function bl(parent, color, mat) return mk(parent, Enum.PartType.Ball, V(1, 1, 1), CFrame.new(), color, mat or Enum.Material.Metal) end
+
+-- cylinder stretched between two points
+local function placeCyl(part, a, b, dia)
+	local d = b - a
+	local len = d.Magnitude
+	if len < 1e-3 then
+		part.Size = V(0.05, dia, dia)
+		part.CFrame = CFrame.new(a)
+		return
+	end
+	local dir = d / len
+	local up = math.abs(dir.Y) > 0.95 and Vector3.xAxis or Vector3.yAxis
+	part.Size = V(len, dia, dia)
+	part.CFrame = CFrame.lookAt((a + b) / 2, b, up) * CFrame.Angles(0, math.pi / 2, 0)
+end
+
+-- box stretched between two points
+local function placeBar(part, a, b, w, dd, hint)
+	local diff = b - a
+	local len = diff.Magnitude
+	if len < 1e-3 then
+		part.Size = V(w, dd, 0.05)
+		part.CFrame = CFrame.new(a)
+		return
+	end
+	local dir = diff / len
+	local h = hint or V(0, 1, 0)
+	if math.abs(dir:Dot(h.Unit)) > 0.95 then h = V(1, 0, 0) end
+	part.Size = V(w, dd, len)
+	part.CFrame = CFrame.lookAt((a + b) / 2, b, h)
+end
+
+local function setBall(part, p, d)
+	part.Size = V(d, d, d)
+	part.CFrame = CFrame.new(p)
+end
+
+local function destroySkin()
+	if skin then
+		skin.model:Destroy()
+		for _, k in ipairs({ "mech", "car", "jet" }) do
+			if skin[k] then skin[k].group:Destroy() end
+		end
+		skin = nil
+	end
+	for _, f in ipairs(fxList) do
+		if f.part then f.part:Destroy() end
+	end
+	fxList = {}
+end
+
+local function newEmitter(parent, fire, sz)
+	local e = Instance.new("ParticleEmitter")
+	e.Rate = 0
+	e.EmissionDirection = Enum.NormalId.Back
+	e.Rotation = NumberRange.new(0, 360)
+	if fire then
+		e.Lifetime = NumberRange.new(0.2, 0.4)
+		e.Speed = NumberRange.new(6 * sz, 10 * sz)
+		e.SpreadAngle = Vector2.new(5, 5)
+		e.Color = ColorSequence.new(Color3.fromRGB(190, 230, 255), Color3.fromRGB(255, 110, 40))
+		e.Size = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0.5 * sz), NumberSequenceKeypoint.new(1, 0.1 * sz) })
+		e.Transparency = NumberSequence.new(0.1, 1)
+		e.LightEmission = 1
+	else
+		e.Lifetime = NumberRange.new(0.6, 1.2)
+		e.Speed = NumberRange.new(1 * sz, 2 * sz)
+		e.SpreadAngle = Vector2.new(25, 25)
+		e.Color = ColorSequence.new(Color3.fromRGB(150, 150, 155), Color3.fromRGB(90, 90, 95))
+		e.Size = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0.3 * sz), NumberSequenceKeypoint.new(1, 1.2 * sz) })
+		e.Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0.5), NumberSequenceKeypoint.new(1, 1) })
+		e.LightEmission = 0
+	end
+	e.Parent = parent
+	return e
+end
+
+local function buildMechSkin(sz)
+	local g = Instance.new("Model")
+	g.Name = "Mech"
+	local m = { group = g }
+	m.pelvis = bx(g, JOINT)
+	m.hipB = { bl(g, JOINT), bl(g, JOINT) }
+	m.waist = cl(g, JOINT)
+	m.chest = bx(g, WHITE)
+	m.chestPlate = bx(g, REDC)
+	m.core = bl(g, NEON, Enum.Material.Neon)
+	m.back = bx(g, WHITE)
+	m.cannon = cl(g, JOINT)
+	m.muzzle = cl(g, REDC)
+	m.vents = { cl(g, JOINT), cl(g, JOINT) }
+	m.ventGlow = { bl(g, Color3.fromRGB(255, 140, 50), Enum.Material.Neon), bl(g, Color3.fromRGB(255, 140, 50), Enum.Material.Neon) }
+	m.neck = cl(g, JOINT)
+	m.head = bx(g, WHITE)
+	m.face = bx(g, Color3.fromRGB(25, 28, 36))
+	m.eyes = { bx(g, NEON, Enum.Material.Neon), bx(g, NEON, Enum.Material.Neon) }
+	m.mouth = { bx(g, NEON, Enum.Material.Neon), bx(g, NEON, Enum.Material.Neon), bx(g, NEON, Enum.Material.Neon) }
+	m.ears = { cl(g, JOINT), cl(g, JOINT) }
+	m.antenna = cl(g, REDC)
+	m.mask = bx(g, WHITE)
+	m.visor = bx(g, NEON, Enum.Material.Neon)
+	m.maskTrim = bx(g, REDC)
+	m.hingeB = bl(g, JOINT)
+	for _, side in ipairs({ "L", "R" }) do
+		m["pad" .. side] = bx(g, REDC)
+		m["shB" .. side] = bl(g, JOINT)
+		m["uarm" .. side] = cl(g, WHITE)
+		m["elB" .. side] = bl(g, JOINT)
+		m["farm" .. side] = cl(g, JOINT)
+		m["gaunt" .. side] = bx(g, WHITE)
+		m["fist" .. side] = bx(g, REDC)
+		m["thigh" .. side] = cl(g, WHITE)
+		m["piston" .. side] = cl(g, Color3.fromRGB(190, 195, 205))
+		m["knB" .. side] = bl(g, JOINT)
+		m["shin" .. side] = cl(g, WHITE)
+		m["shinPlate" .. side] = bx(g, REDC)
+		m["ankB" .. side] = bl(g, JOINT)
+		m["foot" .. side] = bx(g, WHITE)
+	end
+	return m
+end
+
+local function buildCarSkin(sz)
+	local g = newModel(nil, "Car")
+	local m = { group = g, wheels = {} }
+	local function b(x, y, z, w, h, d, color, mat, tr, rot)
+		return mk(g, nil, V(w, h, d) * sz, CFrame.new(x * sz, y * sz, z * sz) * (rot or CFrame.new()), color, mat or Enum.Material.Metal, tr)
+	end
+	local DARKG = Color3.fromRGB(35, 40, 52)
+	local GLASS = Color3.fromRGB(110, 190, 220)
+	b(0, 0.95, 0, 4.2, 0.8, 9.0, REDC)
+	b(0, 1.5, -2.9, 3.9, 0.45, 3.1, REDC)
+	b(0, 2.1, 0.5, 3.6, 1.15, 3.3, REDC)
+	b(0, 2.75, 0.5, 3.3, 0.15, 2.7, DARKG)
+	b(0, 2.2, -1.4, 3.3, 0.08, 1.5, GLASS, Enum.Material.Glass, 0.35, CFrame.Angles(-0.9, 0, 0))
+	b(-1.82, 2.2, 0.5, 0.08, 0.7, 2.4, GLASS, Enum.Material.Glass, 0.35)
+	b(1.82, 2.2, 0.5, 0.08, 0.7, 2.4, GLASS, Enum.Material.Glass, 0.35)
+	b(0, 1.5, 3.2, 3.9, 0.45, 2.1, REDC)
+	b(0, 2.35, 4.3, 3.6, 0.1, 0.9, DARKG)
+	b(-1.4, 2.05, 4.2, 0.12, 0.6, 0.12, DARKG)
+	b(1.4, 2.05, 4.2, 0.12, 0.6, 0.12, DARKG)
+	b(0, 0.75, -4.6, 4.1, 0.5, 0.4, DARKG)
+	b(0, 0.75, 4.6, 4.1, 0.5, 0.4, DARKG)
+	b(-1.4, 1.2, -4.62, 0.9, 0.32, 0.12, Color3.fromRGB(255, 250, 200), Enum.Material.Neon)
+	b(1.4, 1.2, -4.62, 0.9, 0.32, 0.12, Color3.fromRGB(255, 250, 200), Enum.Material.Neon)
+	b(-1.4, 1.25, 4.62, 0.9, 0.28, 0.12, Color3.fromRGB(255, 40, 40), Enum.Material.Neon)
+	b(1.4, 1.25, 4.62, 0.9, 0.28, 0.12, Color3.fromRGB(255, 40, 40), Enum.Material.Neon)
+	b(-2.12, 1.2, 0, 0.05, 0.12, 6.0, NEON, Enum.Material.Neon)
+	b(2.12, 1.2, 0, 0.05, 0.12, 6.0, NEON, Enum.Material.Neon)
+	b(-1.95, 2.1, -1.0, 0.3, 0.2, 0.3, REDC)
+	b(1.95, 2.1, -1.0, 0.3, 0.2, 0.3, REDC)
+	b(0, 0.5, 0, 3.2, 0.05, 6.0, NEON, Enum.Material.Neon, 0.6)
+	m.exhaust = {}
+	for _, sx in ipairs({ -0.9, 0.9 }) do
+		local ex = mk(g, Enum.PartType.Cylinder, V(0.6, 0.35, 0.35) * sz,
+			CFrame.new(sx * sz, 0.55 * sz, 4.7 * sz) * CFrame.Angles(0, math.pi / 2, 0), DARKG, Enum.Material.Metal)
+		table.insert(m.exhaust, newEmitter(ex, false, sz))
+	end
+	-- wheels spin and steer, so they are separate parts
+	for _, key in ipairs({ "footL", "footR", "fistL", "fistR" }) do
+		m.wheels[key] = {
+			tire = mk(g, Enum.PartType.Cylinder, V(0.85, 1.7, 1.7) * sz, CFrame.new(), Color3.fromRGB(28, 28, 32), Enum.Material.SmoothPlastic),
+			hub = mk(g, Enum.PartType.Cylinder, V(0.9, 0.9, 0.9) * sz, CFrame.new(), NEON, Enum.Material.Neon),
+			spoke = mk(g, nil, V(0.3, 0.2, 1.4) * sz, CFrame.new(), Color3.fromRGB(190, 195, 205), Enum.Material.Metal),
+		}
+	end
+	return m
+end
+
+local function buildJetSkin(sz)
+	local g = newModel(nil, "Jet")
+	local m = { group = g, gear = {}, flames = {}, fire = {} }
+	local GREY = Color3.fromRGB(150, 160, 180)
+	local DARKG = Color3.fromRGB(45, 50, 62)
+	local function b(x, y, z, w, h, d, color, mat, tr, rot)
+		return mk(g, nil, V(w, h, d) * sz, CFrame.new(x * sz, y * sz, z * sz) * (rot or CFrame.new()), color, mat or Enum.Material.Metal, tr)
+	end
+	local alongZ = CFrame.Angles(0, math.pi / 2, 0)
+	local function cz(x, y, z, len, dia, color, mat)
+		return mk(g, Enum.PartType.Cylinder, V(len, dia, dia) * sz, CFrame.new(x * sz, y * sz, z * sz) * alongZ, color, mat or Enum.Material.Metal)
+	end
+	cz(0, 1.5, 0, 8.2, 1.3, GREY)
+	for i, w in ipairs({ 1.2, 0.95, 0.7, 0.45, 0.2 }) do cz(0, 1.5, -4.3 - (i - 1) * 0.45, 0.5, w, GREY) end
+	mk(g, Enum.PartType.Ball, V(1.0, 0.75, 2.2) * sz, CFrame.new(0, 1.95 * sz, -1.9 * sz), Color3.fromRGB(110, 190, 220), Enum.Material.Glass, 0.35)
+	b(0, 2.05, 1.6, 0.3, 0.35, 3.0, DARKG)
+	b(-0.9, 1.3, -0.8, 0.7, 0.7, 1.6, DARKG)
+	b(0.9, 1.3, -0.8, 0.7, 0.7, 1.6, DARKG)
+	b(-3.0, 1.45, 0.9, 4.4, 0.14, 2.4, GREY, nil, nil, CFrame.Angles(0, 0.45, 0))
+	b(3.0, 1.45, 0.9, 4.4, 0.14, 2.4, GREY, nil, nil, CFrame.Angles(0, -0.45, 0))
+	b(-5.1, 1.8, 1.7, 0.12, 0.9, 0.9, REDC)
+	b(5.1, 1.8, 1.7, 0.12, 0.9, 0.9, REDC)
+	b(-0.9, 2.4, 3.7, 0.12, 1.7, 1.2, REDC, nil, nil, CFrame.Angles(0, 0, 0.35))
+	b(0.9, 2.4, 3.7, 0.12, 1.7, 1.2, REDC, nil, nil, CFrame.Angles(0, 0, -0.35))
+	b(-1.6, 1.5, 4.0, 2.0, 0.1, 1.0, GREY, nil, nil, CFrame.Angles(0, 0.4, 0))
+	b(1.6, 1.5, 4.0, 2.0, 0.1, 1.0, GREY, nil, nil, CFrame.Angles(0, -0.4, 0))
+	for _, sx in ipairs({ -1, 1 }) do
+		cz(sx * 0.95, 1.25, 2.6, 2.6, 0.95, DARKG)
+		cz(sx * 0.95, 1.25, 3.95, 0.2, 0.8, NEON, Enum.Material.Neon)
+		cz(sx * 2.4, 1.0, -0.2, 2.3, 0.28, Color3.fromRGB(235, 235, 240))
+		mk(g, Enum.PartType.Ball, V(0.28, 0.28, 0.28) * sz, CFrame.new(sx * 2.4 * sz, 1.0 * sz, -1.4 * sz), REDC, Enum.Material.Metal)
+		-- afterburner: a flame whose length follows the throttle + a particle emitter
+		local nozzle = mk(g, nil, V(0.3, 0.3, 0.3) * sz, CFrame.new(), Color3.new(), Enum.Material.SmoothPlastic, 1)
+		table.insert(m.fire, { part = nozzle, em = newEmitter(nozzle, true, sz), x = sx })
+		table.insert(m.flames, {
+			part = mk(g, Enum.PartType.Cylinder, V(1, 1, 1), CFrame.new(), Color3.fromRGB(255, 150, 60), Enum.Material.Neon, 0.35),
+			x = sx,
+		})
+	end
+	-- landing gear (only while on the ground)
+	for _, gp in ipairs({ V(0, 0, -2.6), V(-1.3, 0, 1.8), V(1.3, 0, 1.8) }) do
+		local strut = mk(g, Enum.PartType.Cylinder, V(1.0, 0.15, 0.15) * sz,
+			CFrame.new(gp.X * sz, 0.75 * sz, gp.Z * sz) * CFrame.Angles(0, 0, math.pi / 2), DARKG, Enum.Material.Metal)
+		local wheel = mk(g, Enum.PartType.Cylinder, V(0.25, 0.5, 0.5) * sz,
+			CFrame.new(gp.X * sz, 0.3 * sz, gp.Z * sz), Color3.fromRGB(28, 28, 32), Enum.Material.SmoothPlastic)
+		table.insert(m.gear, strut)
+		table.insert(m.gear, wheel)
+	end
+	return m
+end
+
+local function buildSkin()
+	destroySkin()
+	local sz = S.size
+	local model = Instance.new("Model")
+	model.Name = "MechaSkin"
+	skin = { model = model, shown = nil }
+	skin.mech = buildMechSkin(sz)
+	skin.car = buildCarSkin(sz)
+	skin.jet = buildJetSkin(sz)
+	local hl = Instance.new("Highlight")
+	hl.Adornee = model
+	hl.FillTransparency = 1
+	hl.OutlineColor = NEON
+	hl.OutlineTransparency = 0.3
+	hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+	hl.Parent = model
+	model.Parent = workspace
+end
+
+local function spawnRing(center, maxR, color, dur)
+	if not skin then return end
+	local sz = S.size
+	local part = mk(skin.model, Enum.PartType.Cylinder, V(0.2 * sz, 1, 1),
+		CFrame.new(center) * CFrame.Angles(0, 0, math.pi / 2), color, Enum.Material.Neon, 0.2)
+	table.insert(fxList, { part = part, t0 = tick(), dur = dur, maxR = maxR, center = center, startR = 0.4 * sz })
+end
+
+local function updateFx()
+	local now = tick()
+	local sz = S.size
+	for i = #fxList, 1, -1 do
+		local f = fxList[i]
+		local k = (now - f.t0) / f.dur
+		if k >= 1 or not f.part.Parent then
+			f.part:Destroy()
+			table.remove(fxList, i)
+		else
+			local e = 1 - (1 - k) ^ 2
+			local r = lerp(f.startR, f.maxR, e)
+			f.part.Size = V(0.2 * sz, 2 * r, 2 * r)
+			f.part.CFrame = CFrame.new(f.center) * CFrame.Angles(0, 0, math.pi / 2)
+			f.part.Transparency = 0.2 + 0.8 * k
+		end
+	end
+end
+
+local function updateMechSkin(J, cf)
+	local sz = S.size
+	local R = cf.Rotation
+	local function W(p) return cf:PointToWorldSpace(p * sz) end
+	local m = skin.mech
+	local pr, tr = R * J.pelvisRot, R * J.torsoRot
+	local tF, tR_, tU = tr * V(0, 0, -1), tr * V(1, 0, 0), tr * V(0, 1, 0)
+
+	m.pelvis.Size = V(2.0, 1.0, 1.4) * sz
+	m.pelvis.CFrame = CFrame.new(W(J.pelvis)) * pr
+	for i, side in ipairs({ "L", "R" }) do setBall(m.hipB[i], W(J["hip" .. side]), 0.95 * sz) end
+	placeCyl(m.waist, W(J.pelvis), W(J.chest), 1.0 * sz)
+	m.chest.Size = V(3.1, 1.9, 1.9) * sz
+	m.chest.CFrame = CFrame.new(W(J.chest)) * tr
+	m.chestPlate.Size = V(2.5, 1.4, 0.18) * sz
+	m.chestPlate.CFrame = CFrame.new(W(J.chest) + tF * 1.0 * sz) * tr
+	setBall(m.core, W(J.chest) + tF * 1.05 * sz, 0.55 * sz)
+	m.back.Size = V(2.3, 1.9, 0.9) * sz
+	m.back.CFrame = CFrame.new(W(J.chest) - tF * 1.35 * sz) * tr
+	local cdir = (J.cannonDir.Magnitude > 1e-3) and J.cannonDir.Unit or V(0, 1, 0)
+	local cA, cB = J.cannonPos - cdir * 1.5, J.cannonPos + cdir * 1.5
+	placeCyl(m.cannon, W(cA), W(cB), 0.5 * sz)
+	placeCyl(m.muzzle, W(cB - cdir * 0.1), W(cB + cdir * 0.25), 0.62 * sz)
+	for i, sx in ipairs({ -0.6, 0.6 }) do
+		local base = J.chest + J.torsoRot * V(sx, -0.2, 1.4)
+		placeCyl(m.vents[i], W(base), W(base + J.torsoRot * V(0, -0.2, 0.7)), 0.4 * sz)
+		setBall(m.ventGlow[i], W(base + J.torsoRot * V(0, -0.2, 0.8)), 0.3 * sz)
+	end
+
+	-- head
+	placeCyl(m.neck, W(J.neck), W(J.headC), 0.7 * sz)
+	local hr = R * J.headRot
+	local hF, hRt, hU = hr * V(0, 0, -1), hr * V(1, 0, 0), hr * V(0, 1, 0)
+	m.head.Size = V(1.2, 1.1, 1.25) * sz
+	m.head.CFrame = CFrame.new(W(J.headC)) * hr
+	m.face.Size = V(1.0, 0.9, 0.12) * sz
+	m.face.CFrame = CFrame.new(W(J.headC) + hF * 0.62 * sz) * hr
+	for i, sx in ipairs({ -0.28, 0.28 }) do
+		m.eyes[i].Size = V(0.3, 0.16, 0.08) * sz
+		m.eyes[i].CFrame = CFrame.new(W(J.headC) + hF * 0.7 * sz + hRt * sx * sz + hU * 0.12 * sz) * hr
+		m.ears[i].Size = V(0.35, 0.55, 0.55) * sz
+		m.ears[i].CFrame = CFrame.new(W(J.headC) + hRt * ((i == 1) and -0.72 or 0.72) * sz) * hr
+	end
+	for i = 1, 3 do
+		m.mouth[i].Size = V(0.5, 0.04, 0.05) * sz
+		m.mouth[i].CFrame = CFrame.new(W(J.headC) + hF * 0.7 * sz - hU * (0.15 + i * 0.1) * sz) * hr
+	end
+	placeCyl(m.antenna, W(J.headC) + hU * 0.55 * sz, W(J.headC) + hU * 1.3 * sz - hF * 0.4 * sz, 0.1 * sz)
+	-- mask: closed over the face, hinged open above the head
+	local mr = R * J.maskRot
+	local mF, mU = mr * V(0, 0, -1), mr * V(0, 1, 0)
+	m.mask.Size = V(1.22, 1.08, 0.18) * sz
+	m.mask.CFrame = CFrame.new(W(J.maskPos)) * mr
+	m.visor.Size = V(0.95, 0.14, 0.05) * sz
+	m.visor.CFrame = CFrame.new(W(J.maskPos) + mF * 0.12 * sz + mU * 0.12 * sz) * mr
+	m.maskTrim.Size = V(1.24, 0.12, 0.2) * sz
+	m.maskTrim.CFrame = CFrame.new(W(J.maskPos) - mU * 0.46 * sz) * mr
+	setBall(m.hingeB, W(J.hinge), 0.22 * sz)
+
+	for _, side in ipairs({ "L", "R" }) do
+		local s = (side == "L") and -1 or 1
+		-- shoulder pad + arm
+		local sh = W(J["sh" .. side])
+		m["pad" .. side].Size = V(1.6, 0.45, 1.8) * sz
+		m["pad" .. side].CFrame = CFrame.lookAt(sh + tU * 0.6 * sz + tR_ * s * 0.4 * sz,
+			sh + tU * 0.6 * sz + tR_ * s * 0.4 * sz + tF, tU * 0.8 + tR_ * s * 0.5)
+		setBall(m["shB" .. side], sh, 1.0 * sz)
+		local el, hd = W(J["elb" .. side]), W(J["hand" .. side])
+		placeCyl(m["uarm" .. side], sh, el, 0.75 * sz)
+		setBall(m["elB" .. side], el, 0.85 * sz)
+		placeCyl(m["farm" .. side], el, hd, 0.7 * sz)
+		placeBar(m["gaunt" .. side], el:Lerp(hd, 0.18), el:Lerp(hd, 0.85), 1.05 * sz, 1.05 * sz, tU)
+		local fd = (hd - el)
+		fd = fd.Magnitude > 1e-3 and fd.Unit or V(0, -1, 0)
+		placeBar(m["fist" .. side], hd, hd + fd * 0.9 * sz, 1.0 * sz, 1.05 * sz, tU)
+
+		-- leg + foot
+		local hp, kn, an, to = W(J["hip" .. side]), W(J["knee" .. side]), W(J["ank" .. side]), W(J["toe" .. side])
+		placeCyl(m["thigh" .. side], hp, kn, 1.0 * sz)
+		placeCyl(m["piston" .. side], hp + pr * V(0, 0, -0.6) * sz, kn + pr * V(0, 0, -0.5) * sz, 0.22 * sz)
+		setBall(m["knB" .. side], kn, 1.0 * sz)
+		placeCyl(m["shin" .. side], kn, an, 0.85 * sz)
+		placeBar(m["shinPlate" .. side], kn:Lerp(an, 0.15) + pr * V(0, 0, -0.5) * sz, kn:Lerp(an, 0.85) + pr * V(0, 0, -0.5) * sz, 0.7 * sz, 0.18 * sz, tU)
+		setBall(m["ankB" .. side], an, 0.8 * sz)
+		placeBar(m["foot" .. side], an + V(0, -0.15 * sz, 0), to + V(0, -0.15 * sz, 0), 1.3 * sz, 0.5 * sz, V(0, 1, 0))
+	end
+end
+
+local function updateCarSkin(cf, speedFrac)
+	local sz = S.size
+	local m = skin.car
+	m.group:PivotTo(cf)
+	local R = cf.Rotation
+	for key, w in pairs(m.wheels) do
+		local wp = WHEEL[key]
+		local st = (key == "footL" or key == "footR") and steer or 0
+		local wcf = cf * CFrame.new(wp * sz) * CFrame.Angles(0, st, 0) * CFrame.Angles(wheelA, 0, 0)
+		w.tire.CFrame = wcf
+		w.hub.CFrame = wcf
+		w.spoke.CFrame = wcf
+	end
+	for _, em in ipairs(m.exhaust) do em.Rate = speedFrac * 25 end
+end
+
+local function updateJetSkin(cf, throttle, grounded)
+	local sz = S.size
+	local m = skin.jet
+	m.group:PivotTo(cf)
+	for _, f in ipairs(m.flames) do
+		local L = (0.2 + 2.6 * throttle) * sz
+		f.part.Size = V(L, 0.7 * sz, 0.7 * sz)
+		f.part.CFrame = cf * CFrame.new(f.x * 0.95 * sz, 1.25 * sz, 4.05 * sz + L / 2) * CFrame.Angles(0, math.pi / 2, 0)
+		f.part.Transparency = (throttle > 0.05) and 0.35 or 1
+	end
+	for _, f in ipairs(m.fire) do
+		f.part.CFrame = cf * CFrame.new(f.x * 0.95 * sz, 1.25 * sz, 4.1 * sz) * CFrame.Angles(0, math.pi, 0)
+		f.em.Rate = throttle * 80
+	end
+	for _, p in ipairs(m.gear) do p.Transparency = grounded and 0 or 1 end
+end
+
+----------------------------------------------------------------
+-- GUI (2 pages)
+----------------------------------------------------------------
+local gui = Instance.new("ScreenGui")
+gui.Name = "FTAPMechaGui"
+gui.ResetOnSpawn = false
+local okParent = pcall(function()
+	gui.Parent = (gethui and gethui()) or game:GetService("CoreGui")
+end)
+if not okParent then gui.Parent = lp:WaitForChild("PlayerGui") end
+
+local GUI_H = 322
+local main = Instance.new("Frame")
+main.Size = UDim2.fromOffset(200, GUI_H)
+main.Position = UDim2.new(0, 12, 0, 60)
+main.BackgroundColor3 = Color3.fromRGB(24, 24, 30)
+main.BorderSizePixel = 0
+main.Parent = gui
+Instance.new("UICorner", main).CornerRadius = UDim.new(0, 10)
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, -66, 0, 32)
+title.Position = UDim2.fromOffset(10, 0)
+title.BackgroundTransparency = 1
+title.Text = "Giant Mecha"
+title.TextColor3 = Color3.new(1, 1, 1)
+title.Font = Enum.Font.GothamBold
+title.TextSize = 14
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.Parent = main
+
+local body = Instance.new("Frame")
+body.Size = UDim2.new(1, 0, 1, -32)
+body.Position = UDim2.fromOffset(0, 32)
+body.BackgroundTransparency = 1
+body.Parent = main
+
+local status = Instance.new("TextLabel")
+status.Size = UDim2.new(1, -20, 0, 20)
+status.Position = UDim2.fromOffset(10, 0)
+status.BackgroundTransparency = 1
+status.Text = "Status: idle"
+status.TextColor3 = Color3.fromRGB(170, 170, 185)
+status.Font = Enum.Font.Gotham
+status.TextSize = 12
+status.TextXAlignment = Enum.TextXAlignment.Left
+status.Parent = body
+
+local function setStatus(t) status.Text = "Status: " .. t end
+
+local page1 = Instance.new("Frame")
+page1.Size = UDim2.new(1, 0, 1, 0)
+page1.BackgroundTransparency = 1
+page1.Parent = body
+local page2 = Instance.new("Frame")
+page2.Size = UDim2.new(1, 0, 1, 0)
+page2.BackgroundTransparency = 1
+page2.Visible = false
+page2.Parent = body
+local curParent = page1
+
+local function makeButton(text, x, y, w, h, cb)
+	local b = Instance.new("TextButton")
+	b.Size = UDim2.fromOffset(w, h)
+	b.Position = UDim2.fromOffset(x, y)
+	b.BackgroundColor3 = Color3.fromRGB(52, 52, 66)
+	b.TextColor3 = Color3.new(1, 1, 1)
+	b.Font = Enum.Font.GothamMedium
+	b.TextSize = 13
+	b.Text = text
+	b.BorderSizePixel = 0
+	b.Parent = curParent
+	Instance.new("UICorner", b).CornerRadius = UDim.new(0, 7)
+	b.MouseButton1Click:Connect(function() cb(b) end)
+	return b
+end
+
+local function makeLabel(text, x, y, w)
+	local l = Instance.new("TextLabel")
+	l.Size = UDim2.fromOffset(w, 28)
+	l.Position = UDim2.fromOffset(x, y)
+	l.BackgroundTransparency = 1
+	l.Text = text
+	l.TextColor3 = Color3.new(1, 1, 1)
+	l.Font = Enum.Font.Gotham
+	l.TextSize = 13
+	l.Parent = curParent
+	return l
+end
+
+local function makeHoldButton(text, x, y, w, h, setHeld)
+	local b = makeButton(text, x, y, w, h, function() end)
+	b.MouseButton1Down:Connect(function() setHeld(true) end)
+	b.MouseButton1Up:Connect(function() setHeld(false) end)
+	b.MouseLeave:Connect(function() setHeld(false) end)
+	return b
+end
+
+local function showPage(n)
+	S.page = n
+	page1.Visible = (n == 1)
+	page2.Visible = (n == 2)
+end
+
+local buildBtn, maskBtn, sizeLabel
+local modeBtns, emoteBtns = {}, {}
+
+----------------------------------------------------------------
+-- Control / camera
+----------------------------------------------------------------
+local function restoreHum()
+	if savedHum and savedHum.hum and savedHum.hum.Parent then
+		local h = savedHum.hum
+		h.WalkSpeed = savedHum.WalkSpeed
+		h.JumpPower = savedHum.JumpPower
+		h.JumpHeight = savedHum.JumpHeight
+	end
+	savedHum = nil
+end
+
+local function freezeHum(hum)
+	if savedHum and savedHum.hum == hum then return end
+	restoreHum()
+	savedHum = {
+		hum = hum,
+		WalkSpeed = hum.WalkSpeed,
+		JumpPower = hum.JumpPower,
+		JumpHeight = hum.JumpHeight,
+	}
+	hum.WalkSpeed = 0 -- your joystick steers the mecha, not your avatar
+	hum.JumpPower = 0
+	hum.JumpHeight = 0
+end
+
+local function applyControl(hum)
+	freezeHum(hum)
+	if cam.CameraType ~= Enum.CameraType.Custom then cam.CameraType = Enum.CameraType.Custom end
+	local want = (camPart and S.camFollow) and camPart or hum
+	if lastSubject ~= want then
+		cam.CameraSubject = want
+		lastSubject = want
+	end
+	local zoom = S.camFollow and S.size * 8 or origZoom.min
+	if lastZoom ~= zoom then
+		lp.CameraMinZoomDistance = zoom
+		lp.CameraMaxZoomDistance = math.max(origZoom.max, S.size * 50)
+		lastZoom = zoom
+	end
+end
+
+local function getMove(hum)
+	local md = hum.MoveDirection
+	if md.Magnitude > 0.05 then return V(md.X, 0, md.Z) end
+	if controls then
+		local ok, mv = pcall(function() return controls:GetMoveVector() end)
+		if ok and mv and mv.Magnitude > 0.05 then
+			local wv = cam.CFrame:VectorToWorldSpace(V(mv.X, 0, mv.Z))
+			wv = V(wv.X, 0, wv.Z)
+			if wv.Magnitude > 0.01 then return wv.Unit * math.min(1, mv.Magnitude) end
+		end
+	end
+	return V(0, 0, 0)
+end
+
+----------------------------------------------------------------
+-- Actions
+----------------------------------------------------------------
+local function highlight(tbl, key)
+	for k, b in pairs(tbl) do
+		b.BackgroundColor3 = (k == key) and Color3.fromRGB(70, 110, 200) or Color3.fromRGB(52, 52, 66)
+	end
+end
+
+local function setWant(m)
+	S.want = m
+	highlight(modeBtns, m)
+	if S.active then setStatus("transforming: " .. m) end
+end
+
+local function setEmote(name)
+	if not S.active or S.mode ~= "mech" or S.want ~= "mech" then
+		setStatus("emotes need the mech form")
+		return
+	end
+	if S.attack then return end
+	S.emote = (S.emote == name) and nil or name
+	highlight(emoteBtns, S.emote)
+	setStatus(S.emote and ("emote: " .. S.emote) or "ready")
+end
+
+local function startSkill(name)
+	if not S.active or S.attack or S.mode ~= "mech" or S.want ~= "mech" then return end
+	if wM < 0.99 then return end
+	local sk = SKILLS[name]
+	S.emote = nil
+	highlight(emoteBtns, nil)
+	local a = { name = name, fn = sk.fn, dur = sk.dur, t0 = tick(), fired = false }
+	if name == "punch" then
+		punchSide = -punchSide
+		a.side = punchSide
+	end
+	S.attack = a
+	setStatus(name)
+end
+
+local function setMask(open)
+	S.maskOpen = open
+	maskBtn.Text = "Mask: " .. (open and "OPEN" or "CLOSED")
+	maskBtn.BackgroundColor3 = open and Color3.fromRGB(70, 110, 200) or Color3.fromRGB(52, 52, 66)
+end
+
+-- autopilot: wander around the point where it was switched on
+local function autoMove(t, mode)
+	if autoPause > t then return V(0, 0, 0) end
+	local sz = S.size
+	local flatD = autoTarget and V(autoTarget.X - pos.X, 0, autoTarget.Z - pos.Z).Magnitude or 0
+	if not autoTarget or flatD < 6 * sz or t > autoUntil then
+		local ang = math.random() * TAU
+		local rad = math.random(25, 100) * sz / 3
+		if mode == "jet" then rad *= 2.2 end
+		autoTarget = V(homePos.X + math.cos(ang) * rad, 0, homePos.Z + math.sin(ang) * rad)
+		autoAlt = math.random(25, 70) * sz / 3
+		autoUntil = t + 25
+		if mode ~= "jet" and math.random() < 0.5 then autoPause = t + 1.5 end
+	end
+	local dv = V(autoTarget.X - pos.X, 0, autoTarget.Z - pos.Z)
+	return dv.Magnitude > 1 and dv.Unit or V(0, 0, 0)
+end
+
+----------------------------------------------------------------
+-- Main loop
+----------------------------------------------------------------
+local function step(dt)
+	local root, hum = getRoot(), getHum()
+	if not root or not hum then return end
+	local t = tick()
+	local sz = S.size
+
+	applyControl(hum)
+
+	-- ground
+	local ignore = { lp.Character }
+	local folder = getToyFolder()
+	if folder then table.insert(ignore, folder) end
+	if skin then table.insert(ignore, skin.model) end
+	rayParams.FilterDescendantsInstances = ignore
+	local hit = workspace:Raycast(V(pos.X, pos.Y + 8 * sz, pos.Z), V(0, -4000, 0), rayParams)
+	local gy = hit and hit.Position.Y or pos.Y
+	local alt = math.max(0, pos.Y - gy)
+
+	local function toward(cur, goal, rate) return cur + (goal - cur) * (1 - math.exp(-dt * rate)) end
+
+	-- transform requests: a jet lands first
+	local landing = false
+	if S.mode ~= S.want then
+		if S.mode == "jet" and (alt > 0.6 or jetAir) then
+			landing = true
+		else
+			S.mode = S.want
+			if skin then
+				local g = V(pos.X, gy + 0.3 * sz, pos.Z)
+				spawnRing(g, 9 * sz, NEON, 0.9)
+				spawnRing(g, 5 * sz, Color3.fromRGB(255, 255, 255), 0.6)
+			end
+			setStatus("transforming...")
+		end
+	end
+	local gM, gC, gJ = (S.mode == "mech") and 1 or 0, (S.mode == "car") and 1 or 0, (S.mode == "jet") and 1 or 0
+	local stepW = dt / 1.1
+	wM += math.clamp(gM - wM, -stepW, stepW)
+	wC += math.clamp(gC - wC, -stepW, stepW)
+	wJ += math.clamp(gJ - wJ, -stepW, stepW)
+	local tot = wM + wC + wJ
+	if tot > 0 then wM, wC, wJ = wM / tot, wC / tot, wJ / tot end
+	local settled = math.max(wM, wC, wJ) > 0.995
+
+	-- input (manual or autopilot)
+	local mv
+	if S.auto then mv = autoMove(t, S.mode) else mv = getMove(hum) end
+	local moveInput = mv.Magnitude > 0.1 and settled and not landing
+	if moveInput and S.emote and S.mode == "mech" then
+		S.emote = nil
+		highlight(emoteBtns, nil)
+	end
+
+	-- emote / mask weights
+	sitW = toward(sitW, (S.emote == "sit") and 1 or 0, 3)
+	kneelW = toward(kneelW, (S.emote == "kneel") and 1 or 0, 3)
+	boredW = toward(boredW, (S.emote == "bored") and 1 or 0, 3)
+	handW = toward(handW, (S.emote == "hand") and 1 or 0, 4)
+	d1W = toward(d1W, (S.emote == "dance") and 1 or 0, 4)
+	d2W = toward(d2W, (S.emote == "dance2") and 1 or 0, 4)
+	maskW = toward(maskW, S.maskOpen and 1 or 0, 4)
+
+	-- current skill
+	local a, att, p = S.attack, nil, 0
+	if a then
+		p = (t - a.t0) / a.dur
+		if p >= 1 then
+			S.attack = nil
+			a = nil
+			setStatus("ready")
+		else
+			att = a.fn(p, a)
+		end
+	end
+
+	local newYaw = yaw
+	local turnN = 0
+	local throttle = 0
+	local bodyYaw = 0
+
+	if S.mode == "mech" then
+		-- ======== MECH: heavy ground walker ========
+		local target = 0
+		local emoting = S.emote ~= nil
+		if moveInput and not emoting then
+			target = (S.run and 8 or 3.5) * sz * S.speedMul * (att and att.moveMul or 1)
+		end
+		if not settled then target = 0 end
+		speedNow = toward(speedNow, target, 4)
+		runBlend = toward(runBlend, (S.run and moveInput) and 1 or 0, 4)
+		if moveInput and not emoting and not (att and att.lockFace) then
+			local want = math.atan2(-mv.X, -mv.Z)
+			local diff = (want - yaw + math.pi) % TAU - math.pi
+			newYaw = yaw + math.clamp(diff, -2.2 * dt, 2.2 * dt)
+		end
+		local facing = V(-math.sin(yaw), 0, -math.cos(yaw))
+		pos += facing * speedNow * dt
+		if att and att.rootVel then pos += facing * att.rootVel * dt end
+		pos = V(pos.X, pos.Y + (gy - pos.Y) * math.min(1, dt * 15), pos.Z)
+		vel = facing * speedNow
+		pitch, roll = toward(pitch, 0, 6), toward(roll, 0, 6)
+		jetAir = false
+	elseif S.mode == "car" then
+		-- ======== CAR: drives on the ground ========
+		local topSpeed = (S.run and 22 or 14) * sz * S.speedMul
+		local target = (moveInput) and topSpeed or 0
+		speedNow = toward(speedNow, target, moveInput and 1.4 or 2.2)
+		if moveInput then
+			local want = math.atan2(-mv.X, -mv.Z)
+			local diff = (want - yaw + math.pi) % TAU - math.pi
+			local stp = math.clamp(diff, -2.4 * dt, 2.4 * dt)
+			newYaw = yaw + stp
+			turnN = math.clamp(stp / math.max(dt, 1e-3) / 2.4, -1, 1)
+		end
+		local facing = V(-math.sin(yaw), 0, -math.cos(yaw))
+		pos += facing * speedNow * dt
+		pos = V(pos.X, pos.Y + (gy - pos.Y) * math.min(1, dt * 15), pos.Z)
+		vel = facing * speedNow
+		wheelA = (wheelA + speedNow * dt / (0.85 * sz)) % TAU
+		steer = toward(steer, math.clamp(turnN * 0.5, -0.5, 0.5), 8)
+		local frac = math.clamp(speedNow / (14 * sz), 0, 1.6)
+		pitch = toward(pitch, -(target - speedNow) / math.max(topSpeed, 1) * 0.08, 5)
+		roll = toward(roll, -turnN * 0.1 * frac, 5)
+		jetAir = false
+	else
+		-- ======== JET: fighter jet ========
+		local cruise = 20 * sz * S.speedMul
+		local facing
+		if landing then
+			-- come down and stop before turning back into a mech or car
+			local dsc = -math.clamp(alt * 0.8, 6, cruise * 0.45)
+			vel = vel:Lerp(V(vel.X * 0.97, dsc, vel.Z * 0.97), 1 - math.exp(-dt * 2))
+			pos += vel * dt
+			if pos.Y <= gy + 0.3 then
+				pos = V(pos.X, gy, pos.Z)
+				vel = Vector3.zero
+				jetAir = false
+				speedNow = 0
+			end
+		else
+			local vIn = (S.upHeld and 1 or 0) - (S.downHeld and 1 or 0)
+			if not jetAir and settled and (moveInput or vIn > 0) then
+				jetAir = true
+				vel = V(-math.sin(yaw), 0.4, -math.cos(yaw)) * cruise * 0.5
+			end
+			if jetAir then
+				-- steer toward the joystick direction at a limited turn rate
+				if moveInput then
+					local want = math.atan2(-mv.X, -mv.Z)
+					local diff = (want - yaw + math.pi) % TAU - math.pi
+					local stp = math.clamp(diff, -1.3 * dt, 1.3 * dt)
+					newYaw = yaw + stp
+					turnN = math.clamp(stp / math.max(dt, 1e-3) / 1.3, -1, 1)
+				end
+				facing = V(-math.sin(yaw), 0, -math.cos(yaw))
+				local vy = vIn * cruise * 0.6
+				if S.auto then vy = math.clamp((gy + autoAlt - pos.Y) * 0.8, -cruise * 0.5, cruise * 0.5) end
+				if t < autoUntil - 24.5 and S.auto then vy = math.max(vy, cruise * 0.4) end
+				local tv = facing * cruise + V(0, vy, 0)
+				vel = vel:Lerp(tv, 1 - math.exp(-dt * 1.6))
+				pos += vel * dt
+				if pos.Y < gy + 0.3 then
+					if vel.Y < -cruise * 0.2 then
+						vel = V(vel.X, math.abs(vel.Y) * 0.3, vel.Z) -- no crash landings: bounce up
+					else
+						-- gentle touchdown
+						pos = V(pos.X, gy, pos.Z)
+						vel = Vector3.zero
+						jetAir = false
+					end
+				end
+			else
+				vel = Vector3.zero
+				pos = V(pos.X, pos.Y + (gy - pos.Y) * math.min(1, dt * 15), pos.Z)
+			end
+		end
+		local hsp = V(vel.X, 0, vel.Z).Magnitude
+		speedNow = hsp
+		throttle = jetAir and math.clamp(0.35 + hsp / (cruise * 1.2) * 0.5 + math.max(vel.Y, 0) / cruise * 0.3, 0, 1)
+			or 0
+		pitch = toward(pitch, jetAir and (math.clamp(vel.Y / cruise, -1, 1) * 0.6) or 0, 3)
+		roll = toward(roll, jetAir and math.clamp(-turnN * 0.9, -0.9, 0.9) or 0, 4)
+		if jetAir then speedNow = hsp end
+	end
+	yawRate = (newYaw - yaw) / math.max(dt, 1e-3)
+	yaw = newYaw
+
+	-- keep within range of your avatar (toy streaming / ownership)
+	if S.safe then
+		local rp = root.Position
+		local off = V(pos.X - rp.X, 0, pos.Z - rp.Z)
+		if off.Magnitude > RANGE then
+			local back = off.Unit * (off.Magnitude - RANGE)
+			pos = V(pos.X - back.X, pos.Y, pos.Z - back.Z)
+			vel = vel * 0.5
+		end
+		local floorY = workspace.FallenPartsDestroyHeight + 100
+		if pos.Y < floorY then pos = V(pos.X, floorY, pos.Z) end
+	end
+
+	-- poses for every form that is (partly) built
+	if att and att.bodyYaw then bodyYaw = att.bodyYaw end
+	local J = computeMech(t, dt, att)
+	local cfM = CFrame.new(pos) * CFrame.Angles(0, yaw + bodyYaw, 0)
+	local cY = 1.5 * sz
+	local cfV = CFrame.new(pos) * CFrame.Angles(0, yaw, 0)
+		* CFrame.new(0, cY, 0) * CFrame.Angles(pitch, 0, roll) * CFrame.new(0, -cY, 0)
+	lastBodyCF = cfM
+
+	-- footsteps shake the ground a little
+	if S.mode == "mech" and wM > 0.99 and skin then
+		if J.stompL then spawnRing(cfM:PointToWorldSpace(J.ankL * sz) * V(1, 0, 1) + V(0, gy + 0.2 * sz, 0), 1.6 * sz, Color3.fromRGB(190, 190, 200), 0.4) end
+		if J.stompR then spawnRing(cfM:PointToWorldSpace(J.ankR * sz) * V(1, 0, 1) + V(0, gy + 0.2 * sz, 0), 1.6 * sz, Color3.fromRGB(190, 190, 200), 0.4) end
+	end
+
+	-- one-shot effects
+	local facingNow = V(-math.sin(yaw), 0, -math.cos(yaw))
+	if att and att.fx and a and not a.fired and p >= att.fx.p then
+		a.fired = true
+		local k = att.fx.kind
+		if k == "slam" then
+			spawnRing(V(pos.X, gy + 0.3 * sz, pos.Z) + facingNow * 3.3 * sz, 11 * sz, Color3.new(1, 1, 1), 0.8)
+		elseif k == "punch" then
+			spawnRing(cfM:PointToWorldSpace(J[att.fx.hand] * sz), 2.6 * sz, Color3.fromRGB(255, 200, 120), 0.4)
+		end
+	end
+	updateFx()
+
+	-- skin: show the form that is (mostly) built
+	if S.skin and skin then
+		local shown = (wM >= wC and wM >= wJ) and "mech" or ((wC >= wJ) and "car" or "jet")
+		if skin.shown ~= shown then
+			for _, k in ipairs({ "mech", "car", "jet" }) do
+				skin[k].group.Parent = (k == shown) and skin.model or nil
+			end
+			skin.shown = shown
+		end
+		if shown == "mech" then
+			updateMechSkin(J, cfM)
+		elseif shown == "car" then
+			updateCarSkin(cfV, math.clamp(speedNow / (14 * sz), 0, 1))
+		else
+			updateJetSkin(cfV, throttle, not jetAir and alt < 1)
+		end
+	end
+
+	if camPart then camPart.CFrame = CFrame.new(pos + V(0, 3.4 * sz, 0)) end
+	if not S.auto then homePos = pos end
+
+	-- indestructible upkeep
+	if S.safe then
+		safeTimer += dt
+		if safeTimer >= 0.1 and #claimed > 0 then
+			safeTimer = 0
+			reclaimIdx = reclaimIdx % #claimed + 1
+			local c = claimed[reclaimIdx]
+			if c.part.Parent then
+				if not ownsPart(c.part) then claim(c.part) end
+				c.part.CanCollide = false
+			end
+		end
+		refillTimer += dt
+		if refillTimer >= 1.5 then
+			refillTimer = 0
+			refill()
+		end
+	end
+
+	-- toys: centered on their skin part and rotated like it, in every form
+	local tm = 1 - math.max(wM, wC, wJ) -- 0 when settled; lifts the toys while they fly into the new form
+	for _, c in ipairs(claimed) do
+		local part = c.part
+		if part.Parent then
+			local id = c.id
+			local posAcc, rotAcc, wAcc = Vector3.zero, nil, 0
+			for _, f in ipairs({ { "mech", wM, cfM }, { "car", wC, cfV }, { "jet", wJ, cfV } }) do
+				local fw = f[2]
+				if fw > 0.001 then
+					local pu, dr, nr = formTarget(f[1], id, J)
+					local cf = f[3]
+					posAcc += cf:PointToWorldSpace(pu * sz) * fw
+					local rot = orient(c, cf:VectorToWorldSpace(dr), cf:VectorToWorldSpace(nr))
+					if not rotAcc then
+						rotAcc, wAcc = rot, fw
+					else
+						wAcc += fw
+						rotAcc = rotAcc:Lerp(rot, fw / wAcc)
+					end
+				end
+			end
+			if not rotAcc then rotAcc = CFrame.new() end
+			local tgt = posAcc + V(0, tm * 3 * sz, 0)
+			if S.safe then
+				makeMovers(c)
+				if part.AssemblyLinearVelocity.Magnitude > 700 + sz * 60 then
+					part.AssemblyLinearVelocity = Vector3.zero
+					part.AssemblyAngularVelocity = Vector3.zero
+				end
+				if (part.Position - tgt).Magnitude > 400 then part.CFrame = CFrame.new(tgt) * rotAcc end
+			end
+			c.ap.Position = tgt
+			c.ao.CFrame = rotAcc
+		end
+	end
+end
+
+----------------------------------------------------------------
+-- Summon / release
+----------------------------------------------------------------
+local function release()
+	S.active = false
+	S.emote, S.attack = nil, nil
+	if heartbeat then heartbeat:Disconnect() heartbeat = nil end
+	for _, c in ipairs(claimed) do
+		if c.ap then c.ap:Destroy() end
+		if c.ao then c.ao:Destroy() end
+		if c.att then c.att:Destroy() end
+		if c.part and c.part.Parent then c.part.CanCollide = c.oldCollide end
+	end
+	claimed, claimedSet = {}, {}
+	destroySkin()
+	restoreHum()
+	cam.CameraType = Enum.CameraType.Custom
+	local hum = getHum()
+	if hum then cam.CameraSubject = hum end
+	lastSubject = nil
+	if origZoom then
+		lp.CameraMinZoomDistance = origZoom.min
+		lp.CameraMaxZoomDistance = origZoom.max
+	end
+	lastZoom = nil
+	if camPart then camPart:Destroy() camPart = nil end
+	if buildBtn then buildBtn.Text = "Summon Mecha" end
+	setStatus("released")
+end
+
+local function setSize(v)
+	S.size = math.clamp(v, 3, MAX_SIZE)
+	sizeLabel.Text = "Size: " .. S.size
+	lastZoom = nil
+	if S.active and S.skin then buildSkin() end
+end
+
+local function build()
+	if S.busy or S.active then return end
+	local root = getRoot()
+	if not root then setStatus("no character") return end
+
+	local parts = getToyParts()
+	if #parts == 0 then setStatus("no toys found") return end
+
+	S.busy = true
+	setStatus("claiming toys...")
+	local origin = root.CFrame
+	local teleported = false
+
+	-- sort ladders and planks into the right slots
+	local picks = assign(parts)
+	local okParts = {}
+	for si = 1, #SLOTS do
+		local info = picks[si]
+		if info and info.part.Parent then
+			local part = info.part
+			if (part.Position - root.Position).Magnitude > 30 then
+				root.CFrame = part.CFrame * CFrame.new(0, 4, 0)
+				teleported = true
+				task.wait(0.08)
+			end
+			if claim(part) then
+				addToy(info, si)
+				table.insert(okParts, info)
+			end
+		end
+	end
+	if teleported then root.CFrame = origin end
+
+	if #claimed == 0 then
+		S.busy = false
+		setStatus("no toys claimed")
+		return
+	end
+
+	local fit = fitSize()
+	if fit then S.size = fit end
+	sizeLabel.Text = "Size: " .. S.size
+
+	-- appear in front of you, facing you
+	local look = root.CFrame.LookVector
+	local flat = V(look.X, 0, look.Z)
+	flat = flat.Magnitude > 1e-3 and flat.Unit or V(0, 0, -1)
+	yaw = math.atan2(flat.X, flat.Z)
+	local spot = root.Position + flat * (S.size * 10)
+	local ign = { lp.Character }
+	local folder = getToyFolder()
+	if folder then table.insert(ign, folder) end
+	rayParams.FilterDescendantsInstances = ign
+	local hit = workspace:Raycast(V(spot.X, root.Position.Y + 30, spot.Z), V(0, -500, 0), rayParams)
+	pos = V(spot.X, hit and hit.Position.Y or (root.Position.Y - 3), spot.Z)
+	vel, speedNow, runBlend, phase, lastPhase = Vector3.zero, 0, 0, 0, 0
+	pitch, roll, yawRate, wheelA, steer = 0, 0, 0, 0, 0
+	sitW, kneelW, boredW, handW, d1W, d2W = 0, 0, 0, 0, 0, 0
+	jetAir = false
+	S.mode, S.want = "mech", "mech"
+	wM, wC, wJ = 1, 0, 0
+	highlight(modeBtns, "mech")
+	homePos = pos
+	autoTarget = nil
+
+	origZoom = origZoom or { min = lp.CameraMinZoomDistance, max = lp.CameraMaxZoomDistance }
+	camPart = Instance.new("Part")
+	camPart.Name = "MechaCam"
+	camPart.Anchored = true
+	camPart.CanCollide = false
+	camPart.CanQuery = false
+	camPart.CanTouch = false
+	camPart.Transparency = 1
+	camPart.Size = V(1, 1, 1)
+	camPart.CFrame = CFrame.new(pos + V(0, 3.4 * S.size, 0))
+	camPart.Parent = workspace
+
+	if S.skin then buildSkin() end
+
+	S.active = true
+	buildBtn.Text = "Dismiss Mecha"
+	setStatus(("ready (%d toys)"):format(#claimed))
+	heartbeat = RunService.Heartbeat:Connect(step)
+	S.busy = false
+end
+
+----------------------------------------------------------------
+-- Controls: page 1
+----------------------------------------------------------------
+curParent = page1
+buildBtn = makeButton("Summon Mecha", 10, 22, 180, 28, function()
+	if S.active then release() else task.spawn(build) end
+end)
+
+for i, m in ipairs({ "mech", "car", "jet" }) do
+	local label = ({ mech = "Mech", car = "Car", jet = "Jet" })[m]
+	modeBtns[m] = makeButton(label, 10 + (i - 1) * 62, 52, 56, 28, function() setWant(m) end)
+end
+highlight(modeBtns, "mech")
+
+maskBtn = makeButton("Mask: CLOSED", 10, 82, 88, 28, function() setMask(not S.maskOpen) end)
+maskBtn.TextSize = 11
+makeButton("Auto: OFF", 102, 82, 88, 28, function(b)
+	S.auto = not S.auto
+	b.Text = "Auto: " .. (S.auto and "ON" or "OFF")
+	b.BackgroundColor3 = S.auto and Color3.fromRGB(70, 110, 200) or Color3.fromRGB(52, 52, 66)
+	autoTarget = nil
+	homePos = pos
+end)
+
+makeButton("👊 Punch", 10, 112, 88, 28, function() startSkill("punch") end)
+makeButton("💥 Slam", 102, 112, 88, 28, function() startSkill("slam") end)
+
+makeButton("Run: OFF", 10, 142, 56, 28, function(b)
+	S.run = not S.run
+	b.Text = "Run: " .. (S.run and "ON" or "OFF")
+	b.BackgroundColor3 = S.run and Color3.fromRGB(70, 110, 200) or Color3.fromRGB(52, 52, 66)
+end).TextSize = 11
+makeHoldButton("▲", 72, 142, 56, 28, function(h) S.upHeld = h end)
+makeHoldButton("▼", 134, 142, 56, 28, function(h) S.downHeld = h end)
+
+sizeLabel = makeLabel("Size: 6", 10, 172, 56)
+makeButton("Fit", 66, 172, 34, 28, function()
+	local fit = fitSize()
+	if fit then setSize(fit) end
+end)
+makeButton("-", 104, 172, 40, 28, function() setSize(S.size - 1) end)
+makeButton("+", 150, 172, 40, 28, function() setSize(S.size + 1) end)
+
+local speedLabel = makeLabel("Speed: 1.00x", 10, 202, 90)
+makeButton("-", 104, 202, 40, 28, function()
+	S.speedMul = math.max(0.5, S.speedMul - 0.25)
+	speedLabel.Text = ("Speed: %.2fx"):format(S.speedMul)
+end)
+makeButton("+", 150, 202, 40, 28, function()
+	S.speedMul = math.min(2.5, S.speedMul + 0.25)
+	speedLabel.Text = ("Speed: %.2fx"):format(S.speedMul)
+end)
+
+makeButton("Cam: Follow", 10, 232, 88, 28, function(b)
+	S.camFollow = not S.camFollow
+	b.Text = "Cam: " .. (S.camFollow and "Follow" or "Me")
+	lastZoom = nil
+end)
+makeButton("Skin: ON", 102, 232, 88, 28, function(b)
+	S.skin = not S.skin
+	b.Text = "Skin: " .. (S.skin and "ON" or "OFF")
+	if S.active then
+		if S.skin then buildSkin() else destroySkin() end
+	end
+end)
+
+makeButton("Emotes ▶", 10, 262, 88, 28, function() showPage(2) end)
+makeButton("Safe: ON", 102, 262, 88, 28, function(b)
+	S.safe = not S.safe
+	b.Text = "Safe: " .. (S.safe and "ON" or "OFF")
+	b.BackgroundColor3 = S.safe and Color3.fromRGB(60, 130, 80) or Color3.fromRGB(52, 52, 66)
+end).BackgroundColor3 = Color3.fromRGB(60, 130, 80)
+
+----------------------------------------------------------------
+-- Controls: page 2 (6 emotes)
+----------------------------------------------------------------
+curParent = page2
+makeLabel("Emotes (mech form)", 10, 14, 180).TextSize = 12
+local function emoteButton(key, text, x, y)
+	emoteBtns[key] = makeButton(text, x, y, 88, 36, function() setEmote(key) end)
+	emoteBtns[key].TextSize = 12
+end
+emoteButton("sit", "🪑 Sit", 10, 42)
+emoteButton("dance", "🤖 Dance", 102, 42)
+emoteButton("kneel", "🙇 Kneel", 10, 82)
+emoteButton("dance2", "🕺 Dance 2", 102, 82)
+emoteButton("bored", "😑 Bored", 10, 122)
+emoteButton("hand", "👋 Hand", 102, 122)
+makeButton("Stop emote", 10, 166, 180, 28, function()
+	S.emote = nil
+	highlight(emoteBtns, nil)
+	setStatus("ready")
+end)
+makeButton("◀ Controls", 10, 200, 180, 28, function() showPage(1) end)
+curParent = page1
+
+-- PC keys
+table.insert(conns, UIS.InputBegan:Connect(function(input, gpe)
+	if gpe then return end
+	local k = input.KeyCode
+	if k == Enum.KeyCode.Space then S.upHeld = true
+	elseif k == Enum.KeyCode.LeftShift then S.downHeld = true
+	elseif k == Enum.KeyCode.Q then startSkill("punch")
+	elseif k == Enum.KeyCode.E then startSkill("slam")
+	elseif k == Enum.KeyCode.M then setMask(not S.maskOpen)
+	elseif k == Enum.KeyCode.Z then setWant("mech")
+	elseif k == Enum.KeyCode.X then setWant("car")
+	elseif k == Enum.KeyCode.C then setWant("jet") end
+end))
+table.insert(conns, UIS.InputEnded:Connect(function(input)
+	if input.KeyCode == Enum.KeyCode.Space then S.upHeld = false
+	elseif input.KeyCode == Enum.KeyCode.LeftShift then S.downHeld = false end
+end))
+
+-- Close / unload
+local function unload()
+	S.dead = true
+	release()
+	for _, c in ipairs(conns) do c:Disconnect() end
+	conns = {}
+	if gui then gui:Destroy() end
+	env.FTAPMechaUnload = nil
+end
+env.FTAPMechaUnload = unload
+
+local close = Instance.new("TextButton")
+close.Size = UDim2.fromOffset(24, 24)
+close.Position = UDim2.new(1, -30, 0, 4)
+close.BackgroundColor3 = Color3.fromRGB(150, 50, 50)
+close.Text = "X"
+close.TextColor3 = Color3.new(1, 1, 1)
+close.Font = Enum.Font.GothamBold
+close.TextSize = 12
+close.BorderSizePixel = 0
+close.Parent = main
+Instance.new("UICorner", close).CornerRadius = UDim.new(0, 6)
+close.MouseButton1Click:Connect(unload)
+
+local mini = Instance.new("TextButton")
+mini.Size = UDim2.fromOffset(24, 24)
+mini.Position = UDim2.new(1, -58, 0, 4)
+mini.BackgroundColor3 = Color3.fromRGB(52, 52, 66)
+mini.Text = "-"
+mini.TextColor3 = Color3.new(1, 1, 1)
+mini.Font = Enum.Font.GothamBold
+mini.TextSize = 14
+mini.BorderSizePixel = 0
+mini.Parent = main
+Instance.new("UICorner", mini).CornerRadius = UDim.new(0, 6)
+local minimized = false
+mini.MouseButton1Click:Connect(function()
+	minimized = not minimized
+	body.Visible = not minimized
+	main.Size = minimized and UDim2.fromOffset(200, 32) or UDim2.fromOffset(200, GUI_H)
+	mini.Text = minimized and "+" or "-"
+end)
+
+-- Dragging (kept on screen)
+do
+	local dragging, dragStart, startPos
+	title.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1
+			or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = true
+			dragStart = input.Position
+			startPos = main.Position
+		end
+	end)
+	table.insert(conns, UIS.InputChanged:Connect(function(input)
+		if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+			or input.UserInputType == Enum.UserInputType.Touch) then
+			local d = input.Position - dragStart
+			local vp = gui.AbsoluteSize
+			local nx = math.clamp(startPos.X.Offset + d.X, 0, math.max(0, vp.X - main.AbsoluteSize.X))
+			local ny = math.clamp(startPos.Y.Offset + d.Y, 0, math.max(0, vp.Y - 40))
+			main.Position = UDim2.new(0, nx, 0, ny)
+		end
+	end))
+	table.insert(conns, UIS.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1
+			or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = false
+		end
+	end))
+end

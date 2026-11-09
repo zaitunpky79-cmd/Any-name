@@ -1,4 +1,172 @@
-ref = "F" },
+local Players = game:GetService("Players")
+local RS = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local UIS = game:GetService("UserInputService")
+
+local lp = Players.LocalPlayer
+local cam = workspace.CurrentCamera
+
+-- Re-run safe. The other toy scripts use the same toys, so unload them too.
+local env = (getgenv and getgenv()) or _G
+if env.FTAPMechaUnload then pcall(env.FTAPMechaUnload) end
+for _, k in ipairs({
+	"FTAPDragonUnload", "FTAPStickmanUnload", "FTAPRocketUnload", "FTAPUfoUnload",
+	"FTAPSusanooForm1Unload", "FTAPSusanooHalfUnload", "FTAPSusanooUnload",
+	"FTAPHandUnload", "FTAPSnakeUnload",
+}) do
+	if env[k] then pcall(env[k]) end
+end
+
+local MAX_TOYS = 20
+local MAX_SIZE = 20
+local TAU = math.pi * 2
+local V = Vector3.new
+local RANGE = 450 -- keep within this distance of your avatar (streaming / ownership)
+
+----------------------------------------------------------------
+-- State
+----------------------------------------------------------------
+local S = {
+	active = false,
+	busy = false,
+	dead = false,
+	mode = "mech", -- the form that is built right now: mech | car | jet
+	want = "mech", -- the form you asked for
+	auto = false,
+	run = false,
+	maskOpen = false,
+	camFollow = true,
+	skin = true,
+	safe = true,
+	size = 6, -- studs per unit (the mech is ~7.5 units tall)
+	speedMul = 1,
+	upHeld = false,
+	downHeld = false,
+	emote = nil, -- sit | dance | kneel | dance2 | bored | hand
+	attack = nil,
+	page = 1,
+}
+local claimed, claimedSet = {}, {}
+local heartbeat
+local conns = {}
+local skin, camPart
+local savedHum, lastSubject, origZoom, lastZoom
+local controls
+local fxList = {}
+
+-- motion state
+local pos = Vector3.zero -- ground point under the vehicle's center (also in the air)
+local vel = Vector3.zero
+local yaw, yawRate = 0, 0
+local speedNow, runBlend = 0, 0
+local phase, lastPhase = 0, 0
+local wheelA, steer = 0, 0
+local pitch, roll = 0, 0
+local jetAir = false
+local wM, wC, wJ = 1, 0, 0 -- how much of each form is built (they blend while transforming)
+local maskW = 0
+local sitW, kneelW, boredW, handW, d1W, d2W = 0, 0, 0, 0, 0, 0
+local homePos = Vector3.zero
+local autoTarget, autoUntil, autoPause, autoAlt = nil, 0, 0, 0
+local punchSide = -1
+local safeTimer, refillTimer, reclaimIdx = 0, 0, 0
+local lastBodyCF
+
+local rayParams = RaycastParams.new()
+rayParams.FilterType = Enum.RaycastFilterType.Exclude
+
+local function getRoot()
+	local char = lp.Character
+	return char and char:FindFirstChild("HumanoidRootPart")
+end
+
+local function getHum()
+	local char = lp.Character
+	return char and char:FindFirstChildOfClass("Humanoid")
+end
+
+pcall(function()
+	controls = require(lp:WaitForChild("PlayerScripts"):WaitForChild("PlayerModule", 2)):GetControls()
+end)
+
+----------------------------------------------------------------
+-- Math helpers
+----------------------------------------------------------------
+local function lerp(a, b, t) return a + (b - a) * t end
+
+local function smooth(x)
+	x = math.clamp(x, 0, 1)
+	return x * x * (3 - 2 * x)
+end
+
+local function track(p, keys)
+	if p <= keys[1][1] then return keys[1][2] end
+	for i = 2, #keys do
+		if p <= keys[i][1] then
+			local a, b = keys[i - 1], keys[i]
+			local k = smooth((p - a[1]) / (b[1] - a[1]))
+			if typeof(a[2]) == "Vector3" then return a[2]:Lerp(b[2], k) end
+			return a[2] + (b[2] - a[2]) * k
+		end
+	end
+	return keys[#keys][2]
+end
+
+local function moveProfile(p, a0, b0, D, dur)
+	if p <= a0 or p >= b0 then return 0 end
+	local x = (p - a0) / (b0 - a0)
+	return D * 6 * x * (1 - x) / ((b0 - a0) * dur)
+end
+
+local function ik(s, w, pole, L)
+	local d = w - s
+	local dist = d.Magnitude
+	if dist < 1e-3 then return s end
+	local dir = d / dist
+	local mid = (s + w) / 2
+	local h = 0
+	if dist < 2 * L then h = math.sqrt(L * L - (dist / 2) ^ 2) end
+	local perp = pole - dir * pole:Dot(dir)
+	if perp.Magnitude < 1e-3 then return mid end
+	return mid + perp.Unit * h
+end
+
+local function clampReach(sh, target, maxLen)
+	local d = target - sh
+	local m = d.Magnitude
+	if m > maxLen then return sh + d / m * maxLen end
+	return target
+end
+
+-- Rotation for a toy: its LONG axis along `dir` and its THIN (flat) axis along
+-- `nrm`. c.aL / c.aM / c.aT = the toy's longest / middle / thinnest axis (1 X, 2 Y, 3 Z).
+local function orient(c, dir, nrm)
+	local d = dir.Magnitude > 1e-4 and dir.Unit or V(0, 1, 0)
+	local n = nrm - d * nrm:Dot(d)
+	if n.Magnitude < 1e-3 then
+		n = (math.abs(d.Y) < 0.9) and V(0, 1, 0) or V(1, 0, 0)
+		n = n - d * n:Dot(d)
+	end
+	n = n.Unit
+	local m = (((c.aT - c.aL) % 3) == 1) and d:Cross(n) or n:Cross(d)
+	local vecs = {}
+	vecs[c.aL], vecs[c.aT], vecs[c.aM] = d, n, m
+	return CFrame.fromMatrix(Vector3.zero, vecs[1], vecs[2], vecs[3])
+end
+
+----------------------------------------------------------------
+-- Toy slots: 10 for LADDERS (L) and 10 for FLAT PLANKS (F)
+----------------------------------------------------------------
+local SLOTS = {
+	{ id = "chest", pref = "F" }, { id = "back", pref = "F" }, { id = "spine", pref = "L" },
+	{ id = "hipP", pref = "F" }, { id = "mask", pref = "F" },
+	{ id = "padL", pref = "F" }, { id = "padR", pref = "F" },
+	{ id = "thighL", pref = "L" }, { id = "thighR", pref = "L" },
+	{ id = "shinL", pref = "L" }, { id = "shinR", pref = "L" },
+	{ id = "uarmL", pref = "L" }, { id = "uarmR", pref = "L" },
+	{ id = "farmL", pref = "L" }, { id = "farmR", pref = "L" },
+	{ id = "footL", pref = "F" }, { id = "footR", pref = "F" },
+	{ id = "fistL", pref = "F" }, { id = "fistR", pref = "F" },
 	{ id = "cannon", pref = "L" },
 }
 
@@ -408,6 +576,13 @@ local function computeMech(t, dt, att)
 	if d1W > 0.001 then
 		local p0, p1 = D1[bi + 1], D1[(bi + 1) % 4 + 1]
 		hR = hR:Lerp(J.shR + torsoRot * p0[1]:Lerp(p1[1], snap), d1W)
+		hL = hL:Lerp(J.shL + torsoRot * p0[2]:Lerp(p1[2], snap), d1W)
+	end
+	if d2W > 0.001 then
+		local upPose, downPose = V(1.9, 2.8, -0.3), V(-0.6, -3.0, -1.0)
+		local even = (math.floor(beat) % 2 == 0)
+		local cur, prev = even and upPose or downPose, even and downPose or upPose
+		hR = hR:Lerp(J.shR + torsoRot * prev:Lerp(cur, snap), d2W)
 		hL = hL:Lerp(J.shL + torsoRot * p0[2]:Lerp(p1[2], snap), d1W)
 	end
 	if d2W > 0.001 then
@@ -888,11 +1063,7 @@ local function updateMechSkin(J, cf)
 		m.eyes[i].Size = V(0.3, 0.16, 0.08) * sz
 		m.eyes[i].CFrame = CFrame.new(W(J.headC) + hF * 0.7 * sz + hRt * sx * sz + hU * 0.12 * sz) * hr
 		m.ears[i].Size = V(0.35, 0.55, 0.55) * sz
-		m.ears[i].CFrame = CFrame.new(W(J.headC) + hRt * ((i == 1) and -0.72 or 0.72) * sz) * hr
-	end
-	for i = 1, 3 do
-		m.mouth[i].Size = V(0.5, 0.04, 0.05) * sz
-		m.mouth[i].CFrame = CFrame.new(W(J.headC) + hF * 0.7 * sz - hU * (0.15 + i * 0.1) * sz) * hr
+		m.ears[i].CFrame = CFrame.new(W(J.headC) + hF * 0.7 * sz - hU * (0.15 + i * 0.1) * sz) * hr
 	end
 	placeCyl(m.antenna, W(J.headC) + hU * 0.55 * sz, W(J.headC) + hU * 1.3 * sz - hF * 0.4 * sz, 0.1 * sz)
 	-- mask: closed over the face, hinged open above the head

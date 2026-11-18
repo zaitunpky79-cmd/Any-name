@@ -1,0 +1,1023 @@
+--[[ NOSEY BRICK  -  FE brick animatronic (Delta / any executor)
+  Rebuilt from the Nosey animatronic: same cutscene, crouch/stand, walk cycle, roar, slam, antenna sway.
+  Built ONLY from your own unanchored, unwelded 3-stud bricks (1x1x3), exactly 44 of them.
+
+  BRICK COUNT (counted in bricks, so it does not depend on brick size):
+    Torso 4x2x2 = 16 | Head 3x2x1 = 6 | Arms 2 per side = 4 | Legs 8 per side = 16 | Antennas = 2   -> 44
+
+  Buttons : Spawn/Dismiss | Control (WASD) | Target player (type a name) | Speed box (type any number)
+  Abilities: Punch (F) | Roar (R) | Slam (G) | Disappear (V, press again to come back)
+  GUI     : "N" circle button or RightControl opens/closes the panel; drag it by the title.
+  FE      : colors/shockwaves/camera are LOCAL; the bricks themselves move for everyone. Bricks never collide.
+]]
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UIS = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local lp = Players.LocalPlayer
+local cam = workspace.CurrentCamera
+
+if _G.NoseyBrick then pcall(_G.NoseyBrick) end
+
+local V = Vector3.new
+local TAU = math.pi * 2
+local WANT_LONG = 3 -- the brick we use is 3 studs long
+
+-- colors ---------------------------------------------------------------------------------------
+local DARK, MID, RUST, BIB = Color3.fromRGB(40, 40, 46), Color3.fromRGB(85, 85, 92), Color3.fromRGB(110, 80, 60), Color3.fromRGB(205, 198, 180)
+local GLOW = {Offline = Color3.fromRGB(15, 15, 15), Online = Color3.fromRGB(255, 240, 170), Anger = Color3.fromRGB(255, 30, 30)}
+
+-- state ----------------------------------------------------------------------------------------
+local char, hrp, hum
+local alive, ride = false, false
+local pool, slots = {}, {}
+local saved = {}
+local bones, order, parts = {}, {}, {}
+local cx, cz, L = 1, 1, 3
+local hp, gy, heading = V(), 0, 0
+local SPEED = 50
+local curSp, wavePh = 0, 0
+local crouch, crouchTarget, crouchRate = 1, 1, 4
+local pose = {arm = 0, spread = 0, lean = 0, head = 0, crouch = 0, twist = 0, pArm = 0, pElbow = 0}
+local poseT = {arm = 0, spread = 0, lean = 0, head = 0, crouch = 0, twist = 0, pArm = 0, pElbow = 0}
+local poseRate = 8
+local sink, sinkTarget, hidden = 0, 0, false
+local act, busy, control, targetPl, faceTarget = nil, false, false, nil, nil
+local punchCd, dashT, dashSpd = 0, 0, 0
+local shakeOn = false
+local glowMode = "Offline"
+local cutActive, skipFlag = false, false
+local shakeAmp, shakeEnd = 0, 0
+local avatarCF, avatarSaved = nil, {}
+local headPos, torsoPos = V(), V()
+local camPart
+local oldZoomMax, oldZoomMin, baseFov = 128, 0.5, 70
+local statusLbl, noticeUntil = nil, 0
+local conns = {}
+local radT, guardT, threats, statT, filT, errT = 0, 0, {}, 0, 0, 0
+local controls
+local groundP = RaycastParams.new()
+groundP.FilterType = Enum.RaycastFilterType.Exclude
+groundP.RespectCanCollide = true
+
+pcall(function()
+	controls = require(lp:WaitForChild("PlayerScripts"):WaitForChild("PlayerModule", 3)):GetControls()
+end)
+
+local function clamp(x, a, b) return math.clamp(x, a, b) end
+local function smooth(x) x = clamp(x, 0, 1); return x * x * (3 - 2 * x) end
+local function mix(a, b, k) return a + (b - a) * k end
+local function adiff(a, b) return (a - b + math.pi) % TAU - math.pi end
+
+local function notify(txt, secs)
+	if statusLbl then statusLbl.Text = txt end
+	noticeUntil = os.clock() + (secs or 3)
+end
+local function refChar(c)
+	char = c
+	hrp = c:WaitForChild("HumanoidRootPart")
+	hum = c:WaitForChild("Humanoid")
+end
+refChar(lp.Character or lp.CharacterAdded:Wait())
+
+-- layout: every body part is a block of whole bricks -----------------------------------------------
+local function layout(cxx, czz, LL)
+	local b, o, p = {}, {}, {}
+	local function bone(n, par, pv) b[n] = {parent = par, pv = pv}; o[#o + 1] = n end
+	local function part(bn, c, nx, nz, ny, kind) p[#p + 1] = {bone = bn, c = c, nx = nx, nz = nz, ny = ny, kind = kind} end
+	bone("Root", nil, V(0, 2 * LL, 0))
+	bone("Torso", "Root", V(0, 2 * LL, 0))
+	bone("Head", "Torso", V(0, 4 * LL, 0))
+	part("Torso", V(0, 3 * LL, 0), 4, 2, 2, "torso")
+	part("Head", V(0, 4.5 * LL, 0), 3, 2, 1, "head")
+	for _, s in ipairs({-1, 1}) do
+		local d = s < 0 and "L" or "R"
+		bone("Ant" .. d, "Head", V(s * cxx, 5 * LL, 0))
+		bone("Arm" .. d, "Torso", V(s * 2.5 * cxx, 4 * LL, 0))
+		bone("Fore" .. d, "Arm" .. d, V(s * 2.5 * cxx, 3 * LL, 0))
+		bone("Thigh" .. d, "Root", V(s * cxx, 2 * LL, 0))
+		bone("Shin" .. d, "Thigh" .. d, V(s * cxx, LL, 0))
+		part("Ant" .. d, V(s * cxx, 5.5 * LL, 0), 1, 1, 1, "ant")
+		part("Arm" .. d, V(s * 2.5 * cxx, 3.5 * LL, 0), 1, 1, 1, "arm")
+		part("Fore" .. d, V(s * 2.5 * cxx, 2.5 * LL, 0), 1, 1, 1, "fore")
+		part("Thigh" .. d, V(s * cxx, 1.5 * LL, 0), 2, 2, 1, "thigh")
+		part("Shin" .. d, V(s * cxx, 0.5 * LL, 0), 2, 2, 1, "shin")
+	end
+	return b, o, p
+end
+local NEED = 0
+do
+	local _, _, p = layout(1, 1, 3)
+	for _, pt in ipairs(p) do NEED += pt.nx * pt.nz * pt.ny end
+end
+
+local function slotStyle(kind, i, k, j, nx, ny)
+	if kind == "torso" then
+		if k == 1 and (i == 2 or i == 3) then return BIB, false end
+		if j == ny and (i == 1 or i == nx) then return MID, false end
+		return DARK, false
+	elseif kind == "head" then
+		if k == 1 then
+			if i == 2 then return MID, false end
+			return DARK, true -- eyes
+		end
+		return DARK, false
+	elseif kind == "ant" then return RUST, true
+	elseif kind == "arm" or kind == "thigh" then return DARK, false end
+	return MID, false
+end
+
+-- owner / brick detection ---------------------------------------------------------------------------
+local function ownerState(p)
+	local function match(v)
+		if v == nil then return nil end
+		if typeof(v) == "Instance" then v = v.Name end
+		if type(v) == "number" then return v == lp.UserId end
+		v = tostring(v):lower()
+		return v == lp.Name:lower() or v == lp.DisplayName:lower() or v == tostring(lp.UserId)
+	end
+	local inst = p
+	for _ = 1, 4 do
+		if not inst or inst == workspace then break end
+		for _, nm in ipairs({"Owner", "owner", "Creator", "creator", "Player", "Builder"}) do
+			local a = inst:GetAttribute(nm)
+			if a ~= nil then return match(a) end
+			local c = inst:FindFirstChild(nm)
+			if c and c:IsA("ValueBase") then return match(c.Value) end
+		end
+		local pl = Players:FindFirstChild(inst.Name)
+		if pl and pl:IsA("Player") then return pl == lp end
+		inst = inst.Parent
+	end
+	return nil
+end
+local function usable(p)
+	if not p or not p.Parent or p:IsDescendantOf(char) then return false end
+	if p.Anchored then return false end
+	local okJ, joints = pcall(function() return p:GetJoints() end)
+	if okJ and #joints > 0 then return false end
+	if ownerState(p) == false then return false end
+	if isnetworkowner then
+		local okO, own = pcall(isnetworkowner, p)
+		if okO and not own then return false end
+	end
+	return true
+end
+-- returns sorted list of the most suitable brick type, its dims {short, mid, long}, and how many exist
+local function gather()
+	local root = workspace:FindFirstChild("Bricks")
+	if not root then return nil, "workspace.Bricks not found" end
+	local groups, base = {}, hrp.Position
+	for _, d in ipairs(root:GetDescendants()) do
+		if d:IsA("BasePart") and usable(d) then
+			local s = d.Size
+			local a = {s.X, s.Y, s.Z}
+			table.sort(a)
+			local key = string.format("%.2f,%.2f,%.2f", a[1], a[2], a[3])
+			local g = groups[key]
+			if not g then g = {dims = a, list = {}}; groups[key] = g end
+			g.list[#g.list + 1] = {d, (d.Position - base).Magnitude, ownerState(d) == true and 0 or 1}
+		end
+	end
+	local best, bestScore
+	for _, g in pairs(groups) do
+		local score = #g.list
+		if math.abs(g.dims[3] - WANT_LONG) < 0.3 then score += 1e6 end
+		if not bestScore or score > bestScore then best, bestScore = g, score end
+	end
+	if not best then return nil, "no free bricks found" end
+	table.sort(best.list, function(x, y)
+		if x[3] ~= y[3] then return x[3] < y[3] end
+		return x[2] < y[2]
+	end)
+	return best.list, best.dims
+end
+-- slot axes: shortest brick axis -> rig X, middle -> rig Z, longest -> rig Y
+local function orientFor(p)
+	local s = p.Size
+	local sz = {s.X, s.Y, s.Z}
+	local idx = {1, 2, 3}
+	table.sort(idx, function(a, b) return sz[a] < sz[b] end)
+	local ax = {}
+	ax[idx[1]], ax[idx[2]], ax[idx[3]] = V(1, 0, 0), V(0, 0, 1), V(0, 1, 0)
+	return CFrame.fromMatrix(V(), ax[1], ax[2])
+end
+
+local function groundAt(p, h)
+	local res = workspace:Raycast(p + V(0, h, 0), V(0, -(h + 3000), 0), groundP)
+	return res and res.Position.Y or p.Y
+end
+local function refreshFilters()
+	local f = {char}
+	if camPart then f[#f + 1] = camPart end
+	for _, p in ipairs(pool) do f[#f + 1] = p end
+	for _, pl in ipairs(Players:GetPlayers()) do
+		if pl.Character then f[#f + 1] = pl.Character end
+	end
+	groundP.FilterDescendantsInstances = f
+end
+
+-- glow (local color) --------------------------------------------------------------------------------
+local function setGlow(mode)
+	glowMode = mode
+	for _, s in ipairs(slots) do
+		if s.glow and s.p.Parent then
+			pcall(function()
+				s.p.Color = GLOW[mode]
+				s.p.Material = (mode == "Offline") and Enum.Material.SmoothPlastic or Enum.Material.Neon
+			end)
+		end
+	end
+end
+local function baseGlow()
+	if hidden then return "Offline" end
+	if targetPl then return "Anger" end
+	return "Online"
+end
+
+-- avatar rides inside the body so the bricks stay yours ------------------------------------------------
+local function carryAvatar(on)
+	if on then
+		pcall(function() hrp.Anchored = false end)
+		pcall(function() hum.PlatformStand = true end)
+		avatarSaved = {}
+		for _, d in ipairs(char:GetDescendants()) do
+			if d:IsA("BasePart") then avatarSaved[d] = d.CanCollide; d.CanCollide = false end
+		end
+		pcall(function()
+			local old = hrp:FindFirstChild("NoseyAvatarAntiG")
+			if old then old:Destroy() end
+			local bf = Instance.new("BodyForce")
+			bf.Name = "NoseyAvatarAntiG"
+			bf.Force = V(0, hrp.AssemblyMass * workspace.Gravity, 0)
+			bf.Parent = hrp
+		end)
+	else
+		pcall(function() local bf = hrp:FindFirstChild("NoseyAvatarAntiG"); if bf then bf:Destroy() end end)
+		for d, c in pairs(avatarSaved) do pcall(function() d.CanCollide = c end) end
+		avatarSaved = {}
+		pcall(function() hum.PlatformStand = false end)
+		pcall(function() hrp.AssemblyLinearVelocity = V() end)
+	end
+end
+local function setRide(on)
+	if on == ride then return end
+	ride = on
+	carryAvatar(on)
+	if on then
+		cam.CameraSubject = camPart
+		lp.CameraMaxZoomDistance = 3000
+		lp.CameraMinZoomDistance = clamp(5 * L, 12, 2900)
+	else
+		pcall(function() hrp.CFrame = CFrame.new(hp.X, gy + 8, hp.Z) end)
+		avatarCF = nil
+		cam.CameraSubject = hum
+		lp.CameraMaxZoomDistance, lp.CameraMinZoomDistance = oldZoomMax, oldZoomMin
+	end
+end
+
+-- camera shake + local effects ----------------------------------------------------------------------
+RunService:BindToRenderStep("NoseyShake", Enum.RenderPriority.Camera.Value + 1, function()
+	local left = shakeEnd - os.clock()
+	if left > 0 and not cutActive then
+		local a = shakeAmp * math.min(1, left)
+		cam.CFrame = cam.CFrame * CFrame.new((math.random() - 0.5) * a, (math.random() - 0.5) * a, 0)
+			* CFrame.Angles(0, 0, (math.random() - 0.5) * a * 0.02)
+	end
+end)
+local function shakeFrom(pos, power, secs, range)
+	local k = clamp(1 - (cam.CFrame.Position - pos).Magnitude / range, 0, 1)
+	if k > 0 then shakeAmp, shakeEnd = power * k, os.clock() + secs end
+end
+local function shockwave(pos, radius)
+	local p = Instance.new("Part")
+	p.Anchored, p.CanCollide, p.CanQuery, p.CanTouch = true, false, false, false
+	p.Shape = Enum.PartType.Cylinder
+	p.Material = Enum.Material.Neon
+	p.Color = Color3.fromRGB(255, 120, 60)
+	p.Transparency = 0.35
+	p.Size = V(0.4, 2, 2)
+	p.CFrame = CFrame.new(pos + V(0, 0.3, 0)) * CFrame.Angles(0, 0, math.pi / 2)
+	p.Parent = workspace
+	TweenService:Create(p, TweenInfo.new(0.7, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+		{Size = V(0.4, radius * 2, radius * 2), Transparency = 1}):Play()
+	game:GetService("Debris"):AddItem(p, 0.9)
+end
+
+-- poses ---------------------------------------------------------------------------------------------
+local function poseSet(t, rate)
+	for k in pairs(poseT) do poseT[k] = t[k] or 0 end
+	poseRate = rate or 8
+end
+
+-- players --------------------------------------------------------------------------------------------
+local function targetHrp(pl)
+	local c = pl and pl.Character
+	return c and c:FindFirstChild("HumanoidRootPart")
+end
+local function findPlayer(txt)
+	txt = string.lower(txt or ""):match("^%s*(.-)%s*$")
+	if txt == "" then return nil end
+	local partial
+	for _, pl in ipairs(Players:GetPlayers()) do
+		if pl ~= lp then
+			local n, d = pl.Name:lower(), pl.DisplayName:lower()
+			if n == txt or d == txt then return pl end
+			if not partial and (n:sub(1, #txt) == txt or d:sub(1, #txt) == txt) then partial = pl end
+		end
+	end
+	return partial
+end
+local function getMove()
+	local mv
+	if controls then
+		local ok, v = pcall(function() return controls:GetMoveVector() end)
+		if ok then mv = v end
+	end
+	if mv then
+		local w = cam.CFrame:VectorToWorldSpace(V(mv.X, 0, mv.Z))
+		w = V(w.X, 0, w.Z)
+		if w.Magnitude > 0.01 then return w.Unit * math.min(1, mv.Magnitude) end
+		return V()
+	end
+	local d = hum.MoveDirection
+	return V(d.X, 0, d.Z)
+end
+
+-- skills (anticipation -> action -> follow-through) ----------------------------------------------------------
+local skills = {}
+local function groundFront(dist)
+	local F = V(-math.sin(heading), 0, -math.cos(heading))
+	return V(hp.X, gy, hp.Z) + F * dist
+end
+
+function skills.Roar()
+	poseSet({crouch = 0.5, lean = -0.3, arm = -0.4}, 6)
+	task.wait(0.5)
+	setGlow("Anger")
+	shakeFrom(headPos, 1.2, 2.4, 250)
+	poseSet({lean = 0.3, head = 0.8, arm = 2.3, spread = 0.6}, 10)
+	task.wait(2.2)
+	poseSet({}, 4)
+	task.wait(0.6)
+end
+
+function skills.Slam()
+	poseSet({arm = 2.8, lean = 0.2, head = 0.4, crouch = 0.2}, 6)
+	task.wait(0.8)
+	poseSet({arm = -0.1, lean = -0.6, head = -0.2, crouch = 0.5}, 22)
+	task.wait(0.18)
+	local gp = groundFront(1.2 * L)
+	shockwave(gp, 9 * L)
+	shakeFrom(gp, 1.4, 0.9, 200)
+	task.wait(0.2)
+	poseSet({}, 3)
+	task.wait(0.9)
+end
+
+function skills.Punch(pl)
+	faceTarget = pl or targetPl
+	poseSet({pArm = -1.1, pElbow = 1.1, twist = -0.55, lean = 0.15, crouch = 0.25}, 9) -- wind up
+	task.wait(0.5)
+	faceTarget = nil
+	poseSet({pArm = 1.55, pElbow = -0.2, twist = 0.6, lean = -0.35, crouch = 0.15}, 26) -- strike
+	dashT, dashSpd = 0.2, 7 * L
+	task.wait(0.14)
+	local gp = groundFront(2.2 * L)
+	shockwave(gp, 3 * L)
+	shakeFrom(gp, 0.9, 0.5, 150)
+	task.wait(0.25)
+	poseSet({}, 4)
+	task.wait(0.8)
+end
+
+function skills.Disappear()
+	if not hidden then
+		poseSet({crouch = 1}, 6)
+		task.wait(0.6)
+		shockwave(groundFront(0), 5 * L)
+		shakeFrom(V(hp.X, gy, hp.Z), 0.8, 0.6, 150)
+		sinkTarget = 1
+		task.wait(1.1)
+		hidden = true
+		targetPl = nil
+	else
+		hidden = false
+		poseSet({crouch = 1}, 6)
+		sinkTarget = 0
+		task.wait(1.1)
+		shockwave(groundFront(0), 7 * L)
+		shakeFrom(V(hp.X, gy, hp.Z), 1.2, 0.8, 200)
+		poseSet({lean = 0.2, head = 0.5, arm = 1.2, spread = 0.4}, 10)
+		task.wait(0.8)
+		poseSet({}, 4)
+		task.wait(0.4)
+	end
+end
+
+local function runSkill(name, pl)
+	if not alive then notify("Spawn first", 2) return end
+	if cutActive or busy then return end
+	if act then notify("Busy: " .. act, 2) return end
+	if hidden and name ~= "Disappear" then notify("Hidden - press Disappear to return", 3) return end
+	act = name
+	local ok, err = pcall(skills[name], pl)
+	if not ok then warn("[NoseyBrick] " .. tostring(err)) end
+	poseSet({}, 4)
+	setGlow(baseGlow())
+	faceTarget = nil
+	act = nil
+	punchCd = 0.5
+end
+
+-- cutscene GUI -----------------------------------------------------------------------------------------
+local guiParent
+do
+	local ok, g = pcall(function() return (gethui and gethui()) end)
+	guiParent = (ok and g) or lp:WaitForChild("PlayerGui")
+end
+local function mk(class, props, parent)
+	local o = Instance.new(class)
+	for k, v in pairs(props) do o[k] = v end
+	o.Parent = parent
+	return o
+end
+local function round(o, r) mk("UICorner", {CornerRadius = UDim.new(0, r or 8)}, o) end
+
+local cine = mk("ScreenGui", {Name = "NoseyCine", ResetOnSpawn = false, IgnoreGuiInset = true, DisplayOrder = 60}, guiParent)
+local barTop = mk("Frame", {Size = UDim2.new(1, 0, 0, 0), BackgroundColor3 = Color3.new(0, 0, 0), BorderSizePixel = 0, Visible = false, ZIndex = 10}, cine)
+local barBot = mk("Frame", {Size = UDim2.new(1, 0, 0, 0), AnchorPoint = Vector2.new(0, 1), Position = UDim2.new(0, 0, 1, 0),
+	BackgroundColor3 = Color3.new(0, 0, 0), BorderSizePixel = 0, Visible = false, ZIndex = 10}, cine)
+local titleLbl = mk("TextLabel", {Size = UDim2.new(1, 0, 0, 50), Position = UDim2.new(0, 0, 0.68, 0), BackgroundTransparency = 1, Text = "NOSEY",
+	TextColor3 = Color3.fromRGB(255, 235, 170), Font = Enum.Font.GothamBlack, TextSize = 38, TextTransparency = 1, TextStrokeTransparency = 1,
+	Visible = false, ZIndex = 12}, cine)
+local subLbl = mk("TextLabel", {Size = UDim2.new(1, 0, 0, 20), Position = UDim2.new(0, 0, 0.68, 52), BackgroundTransparency = 1, Text = "SECURITY ANIMATRONIC",
+	TextColor3 = Color3.fromRGB(220, 205, 175), Font = Enum.Font.GothamMedium, TextSize = 14, TextTransparency = 1, TextStrokeTransparency = 1,
+	Visible = false, ZIndex = 12}, cine)
+local skipBtn = mk("TextButton", {Size = UDim2.fromOffset(92, 30), AnchorPoint = Vector2.new(1, 1), Position = UDim2.new(1, -16, 1, -16),
+	BackgroundColor3 = Color3.new(0, 0, 0), BackgroundTransparency = 0.35, Text = "Skip >>", TextColor3 = Color3.new(1, 1, 1),
+	Font = Enum.Font.GothamMedium, TextSize = 12, Visible = false, ZIndex = 20}, cine)
+round(skipBtn, 8)
+skipBtn.Activated:Connect(function() skipFlag = true end)
+local function fadeText(l, to, secs)
+	TweenService:Create(l, TweenInfo.new(secs), {TextTransparency = to, TextStrokeTransparency = (to >= 1) and 1 or 0.4}):Play()
+end
+
+local winRef, openRef
+local winWas = true
+local function cineShow()
+	winWas = winRef and winRef.Visible or false
+	if winRef then winRef.Visible = false end
+	if openRef then openRef.Visible = false end
+	barTop.Visible, barBot.Visible, skipBtn.Visible = true, true, true
+	local ti = TweenInfo.new(0.9, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+	TweenService:Create(barTop, ti, {Size = UDim2.new(1, 0, 0.12, 0)}):Play()
+	TweenService:Create(barBot, ti, {Size = UDim2.new(1, 0, 0.12, 0)}):Play()
+end
+local function cineHide()
+	fadeText(titleLbl, 1, 0.3)
+	fadeText(subLbl, 1, 0.3)
+	skipBtn.Visible = false
+	local ti = TweenInfo.new(0.6, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+	TweenService:Create(barTop, ti, {Size = UDim2.new(1, 0, 0, 0)}):Play()
+	TweenService:Create(barBot, ti, {Size = UDim2.new(1, 0, 0, 0)}):Play()
+	if winRef then winRef.Visible = winWas end
+	if openRef then openRef.Visible = true end
+	task.delay(0.7, function()
+		if not cutActive then barTop.Visible, barBot.Visible, titleLbl.Visible, subLbl.Visible = false, false, false, false end
+	end)
+end
+
+-- intro cutscene (3.5s dark crouch -> 1.2s eyes light up -> 2.2s stands up) -------------------------------
+local function runIntro()
+	cutActive, skipFlag, busy = true, false, true
+	setGlow("Offline")
+	crouch, crouchTarget, crouchRate = 1, 1, 4
+	cam.CameraType = Enum.CameraType.Scriptable
+	cineShow()
+	task.delay(4.0, function()
+		if cutActive then titleLbl.Visible, subLbl.Visible = true, true; fadeText(titleLbl, 0, 0.8); fadeText(subLbl, 0.2, 1.0) end
+	end)
+	task.delay(6.0, function() fadeText(titleLbl, 1, 0.6); fadeText(subLbl, 1, 0.6) end)
+	task.spawn(function()
+		local t0, stage = os.clock(), 0
+		local sc = (6 * L) / 10.9
+		while alive do
+			RunService.RenderStepped:Wait()
+			local t = os.clock() - t0
+			if skipFlag or t >= 6.9 then break end
+			if t >= 3.5 and stage < 1 then stage = 1; setGlow("Online"); shakeOn = true end
+			if t >= 4.7 and stage < 2 then stage = 2; crouchRate, crouchTarget = 1.6, 0 end
+			local rc = CFrame.new(hp.X, gy, hp.Z) * CFrame.Angles(0, heading, 0)
+			local pos, target, fov
+			if t < 3.5 then
+				local k = smooth(t / 3.5)
+				pos = rc:PointToWorldSpace(V(0, mix(-1, 1.5, k) + 2 * sc, mix(-60, -16, k)) * sc)
+				target, fov = headPos, mix(70, 50, k)
+			elseif t < 4.7 then
+				local k = (t - 3.5) / 1.2
+				local jitter = V(math.random() - 0.5, math.random() - 0.5, 0) * 0.25 * k * sc
+				pos = rc:PointToWorldSpace(V(0, 1.5 + 0.4 * k + 2 * sc, mix(-16, -9, k)) * sc) + jitter
+				target, fov = headPos, mix(50, 32, smooth(k))
+			else
+				local k = smooth((t - 4.7) / 2.2)
+				local a = k * 1.1
+				local r, h = mix(9, 34, k), mix(2.5, 6, k)
+				pos = rc:PointToWorldSpace(V(math.sin(a) * r, h + 2 * sc, -math.cos(a) * r) * sc)
+				target = headPos:Lerp(torsoPos, k)
+				fov = mix(32, 68, k)
+			end
+			cam.CFrame = CFrame.lookAt(pos, target)
+			cam.FieldOfView = fov
+		end
+		cutActive, busy, shakeOn = false, false, false
+		crouchTarget, crouchRate = 0, 4
+		setGlow(baseGlow())
+		cam.CameraType = Enum.CameraType.Custom
+		cam.FieldOfView = baseFov
+		cineHide()
+	end)
+end
+
+-- dismiss / summon ----------------------------------------------------------------------------------
+local function dismiss()
+	skipFlag = true
+	cutActive, busy = false, false
+	cam.CameraType = Enum.CameraType.Custom
+	pcall(function() cam.FieldOfView = baseFov end)
+	cineHide()
+	setRide(false)
+	for _, s in ipairs(saved) do
+		local p = s.p
+		if p and p.Parent then
+			pcall(function()
+				local bf = p:FindFirstChild("NoseyAntiG")
+				if bf then bf:Destroy() end
+				p.CFrame = s.cf
+				p.Anchored = s.anchored
+				p.CanCollide = s.collide
+				p.Color, p.Material = s.color, s.material
+				p.AssemblyLinearVelocity = V()
+			end)
+		end
+	end
+	if camPart then camPart:Destroy() end
+	camPart = nil
+	pool, slots, saved = {}, {}, {}
+	alive, control, hidden, targetPl, act, faceTarget = false, false, false, nil, nil, nil
+	sink, sinkTarget, curSp = 0, 0, 0
+	avatarCF = nil
+	cam.CameraSubject = hum
+end
+
+local function summon()
+	if alive then return end
+	local list, dims = gather()
+	if not list then notify("Cannot spawn: " .. tostring(dims), 6) return end
+	if #list < NEED then
+		notify(string.format("Need %d bricks of one size (1x1x3), found %d (%.1fx%.1fx%.1f). Stand next to your own bricks.",
+			NEED, #list, dims[1], dims[2], dims[3]), 9)
+		return
+	end
+	pool = {}
+	for i = 1, NEED do pool[i] = list[i][1] end
+	cx, cz, L = dims[1], dims[2], dims[3]
+	bones, order, parts = layout(cx, cz, L)
+
+	slots, saved = {}, {}
+	local idx = 0
+	for _, pt in ipairs(parts) do
+		for j = 1, pt.ny do
+			for k = 1, pt.nz do
+				for i = 1, pt.nx do
+					idx += 1
+					local p = pool[idx]
+					local off = V((i - 0.5 - pt.nx / 2) * cx, (j - 0.5 - pt.ny / 2) * L, (k - 0.5 - pt.nz / 2) * cz)
+					local color, glow = slotStyle(pt.kind, i, k, j, pt.nx, pt.ny)
+					slots[idx] = {p = p, bone = pt.bone, off = (pt.c + off) - bones[pt.bone].pv, orient = orientFor(p), color = color, glow = glow}
+					saved[idx] = {p = p, cf = p.CFrame, anchored = p.Anchored, collide = p.CanCollide, color = p.Color, material = p.Material}
+				end
+			end
+		end
+	end
+	for _, s in ipairs(slots) do
+		local p = s.p
+		pcall(function() p.Anchored = false; p.CanCollide = false end)
+		pcall(function()
+			local bf = Instance.new("BodyForce")
+			bf.Name = "NoseyAntiG"
+			bf.Force = V(0, p.AssemblyMass * workspace.Gravity, 0)
+			bf.Parent = p
+		end)
+		pcall(function() p.Color = s.color; p.Material = Enum.Material.SmoothPlastic end)
+	end
+	pcall(function() lp.MaximumSimulationRadius = math.huge end)
+	pcall(function() sethiddenproperty(lp, "SimulationRadius", math.huge) end)
+
+	camPart = mk("Part", {Anchored = true, CanCollide = false, CanQuery = false, Transparency = 1, Size = V(1, 1, 1)}, workspace)
+	refreshFilters()
+	oldZoomMax, oldZoomMin = lp.CameraMaxZoomDistance, lp.CameraMinZoomDistance
+	baseFov = cam.FieldOfView
+
+	local look = hrp.CFrame.LookVector
+	look = V(look.X, 0, look.Z)
+	look = look.Magnitude > 1e-3 and look.Unit or V(0, 0, -1)
+	heading = math.atan2(look.X, look.Z) -- faces you
+	local sp0 = hrp.Position + look * (4 * L + 10)
+	hp = V(sp0.X, 0, sp0.Z)
+	gy = groundAt(V(sp0.X, hrp.Position.Y, sp0.Z), 40)
+	crouch, crouchTarget, crouchRate, curSp, wavePh = 1, 1, 4, 0, 0
+	sink, sinkTarget, hidden, control, targetPl = 0, 0, false, false, nil
+	for k in pairs(pose) do pose[k] = 0; poseT[k] = 0 end
+	headPos, torsoPos = V(hp.X, gy + 4.5 * L, hp.Z), V(hp.X, gy + 3 * L, hp.Z)
+	alive = true
+	setGlow("Offline")
+	runIntro()
+	notify(string.format("%d bricks used (%.0fx%.0fx%.0f each) | height %.0f studs", NEED, cx, cz, L, 6 * L), 6)
+end
+
+-- main step -----------------------------------------------------------------------------------------
+local function step(dt)
+	local t = os.clock()
+	local F = V(-math.sin(heading), 0, -math.cos(heading))
+	gy = groundAt(V(hp.X, gy, hp.Z), 6 * L + 30)
+	punchCd = math.max(0, punchCd - dt)
+
+	-- 1) movement intent
+	local wantDir, tgtSp = nil, 0
+	if not (busy or act or hidden or cutActive) then
+		if control then
+			local mv = getMove()
+			if mv.Magnitude > 0.1 then wantDir, tgtSp = mv.Unit, SPEED * math.min(1, mv.Magnitude) end
+		elseif targetPl then
+			local th = targetHrp(targetPl)
+			local tHum = th and th.Parent and th.Parent:FindFirstChildOfClass("Humanoid")
+			if not th or not targetPl.Parent then
+				targetPl = nil
+				notify("Target lost", 3)
+			elseif tHum and tHum.Health <= 0 then
+				targetPl = nil
+				notify("Target down", 3)
+			else
+				local flat = V(th.Position.X - hp.X, 0, th.Position.Z - hp.Z)
+				local dist = flat.Magnitude
+				local range = 2.6 * L
+				if dist > 1e-3 then wantDir = flat.Unit end
+				if dist > range * 0.85 then tgtSp = SPEED * smooth((dist - range * 0.85) / L + 0.25) end
+				if dist <= range and punchCd <= 0 then task.spawn(runSkill, "Punch", targetPl) end
+			end
+		end
+	end
+	if act and faceTarget then
+		local th = targetHrp(faceTarget)
+		if th then
+			local flat = V(th.Position.X - hp.X, 0, th.Position.Z - hp.Z)
+			if flat.Magnitude > 1e-3 then
+				heading += clamp(adiff(math.atan2(-flat.X, -flat.Z), heading) * math.min(1, dt * 6), -5 * dt, 5 * dt)
+			end
+		end
+	end
+	if wantDir then
+		local d = adiff(math.atan2(-wantDir.X, -wantDir.Z), heading)
+		heading += clamp(d * math.min(1, dt * 4), -3 * dt, 3 * dt)
+	end
+	F = V(-math.sin(heading), 0, -math.cos(heading))
+	curSp += (tgtSp - curSp) * math.min(1, dt * ((tgtSp > curSp) and 2.5 or 5))
+	if curSp > 0.2 then hp = hp + F * curSp * dt end
+	if dashT > 0 then dashT -= dt; hp = hp + F * dashSpd * dt end
+
+	-- 2) pose blending
+	crouch += (crouchTarget - crouch) * clamp(dt * crouchRate, 0, 1)
+	local kp = clamp(dt * poseRate, 0, 1)
+	for key, v in pairs(pose) do pose[key] = v + (poseT[key] - v) * kp end
+	sink += (sinkTarget - sink) * clamp(dt * 3.5, 0, 1)
+	local ce = clamp(crouch + pose.crouch, 0, 1.2)
+
+	-- 3) walk cycle + joints (ported from the Nosey animatronic)
+	local sp = curSp
+	local a = clamp(sp / 50, 0, 1)
+	wavePh += dt * (4 + math.min(sp, 60) * 0.5)
+	local sw = math.sin(wavePh)
+	local amp = (0.35 + 0.65 * a) * (1 - math.min(ce, 1) * 0.8) * clamp(sp / 4, 0, 1)
+	local hL, hR = ce * 1.35 + sw * amp, ce * 1.35 - sw * amp
+	local kL = -ce * 2.1 - math.max(0, math.cos(wavePh)) * a * 1.3
+	local kR = -ce * 2.1 - math.max(0, -math.cos(wavePh)) * a * 1.3
+	local sway = math.sin(t * 2.2) * 0.08
+	local tw = shakeOn and math.sin(t * 40) * 0.12 or 0
+	local rot = {
+		Root = CFrame.new(),
+		Torso = CFrame.Angles(-ce * 0.7 - a * 0.45 + pose.lean, pose.twist, 0),
+		Head = CFrame.Angles(ce * 0.5 + a * 0.35 + pose.head, 0, math.sin(t * 0.7) * 0.04),
+		AntL = CFrame.Angles(0, 0, 0.15 + sway + tw),
+		AntR = CFrame.Angles(0, 0, -0.15 - sway - tw),
+		ArmL = CFrame.Angles(ce * 0.5 - a * 0.4 - sw * 0.8 * a + pose.arm, pose.spread, 0),
+		ArmR = CFrame.Angles(ce * 0.5 - a * 0.4 + sw * 0.8 * a + pose.arm + pose.pArm, -pose.spread, 0),
+		ForeL = CFrame.Angles(0.25 + a * 0.9 + ce * 0.4 - pose.arm * 0.15, 0, 0),
+		ForeR = CFrame.Angles(0.25 + a * 0.9 + ce * 0.4 - pose.arm * 0.15 + pose.pElbow, 0, 0),
+		ThighL = CFrame.Angles(hL, 0, 0), ThighR = CFrame.Angles(hR, 0, 0),
+		ShinL = CFrame.Angles(kL, 0, 0), ShinR = CFrame.Angles(kR, 0, 0),
+	}
+	-- keep the lowest foot on the ground while crouching / walking
+	local reach = math.max(L * (math.cos(hL) + math.cos(hL + kL)), L * (math.cos(hR) + math.cos(hR + kR)))
+	local baseY = gy + (reach - 2 * L) - sink * 6.6 * L
+	local baseCF = CFrame.new(hp.X, baseY, hp.Z) * CFrame.Angles(0, heading, 0)
+
+	-- 4) forward kinematics -> brick CFrames
+	local M = {}
+	for _, name in ipairs(order) do
+		local b = bones[name]
+		if b.parent then
+			M[name] = M[b.parent] * CFrame.new(b.pv - bones[b.parent].pv) * rot[name]
+		else
+			M[name] = CFrame.new(b.pv) * rot[name]
+		end
+	end
+	for _, s in ipairs(slots) do
+		s.cf = baseCF * M[s.bone] * CFrame.new(s.off) * s.orient
+	end
+	headPos = (baseCF * M.Head * CFrame.new(V(0, 4.5 * L, 0) - bones.Head.pv)).Position
+	torsoPos = (baseCF * M.Torso * CFrame.new(V(0, 3 * L, 0) - bones.Torso.pv)).Position
+
+	-- 5) avatar inside the body + guard (stay the closest player so the bricks stay yours)
+	avatarCF = CFrame.new(torsoPos)
+	radT += dt
+	if radT > 1 then
+		radT = 0
+		pcall(function() lp.MaximumSimulationRadius = math.huge end)
+		pcall(function() sethiddenproperty(lp, "SimulationRadius", math.huge) end)
+	end
+	guardT += dt
+	if guardT > 0.1 then
+		guardT = 0
+		threats = {}
+		local near = 120 + 4 * L
+		for _, pl in ipairs(Players:GetPlayers()) do
+			if pl ~= lp then
+				local th = targetHrp(pl)
+				if th and (th.Position - torsoPos).Magnitude < near + 6 * L then
+					local bp, bd
+					for _, s in ipairs(slots) do
+						local d = (s.cf.Position - th.Position).Magnitude
+						if not bd or d < bd then bd, bp = d, s.cf.Position end
+					end
+					if bd and bd < near then threats[#threats + 1] = {pos = bp, d = bd} end
+				end
+			end
+		end
+		table.sort(threats, function(x, y) return x.d < y.d end)
+	end
+	if #threats > 0 and ride then
+		local k = (math.floor(os.clock() * 8) % #threats) + 1
+		avatarCF = CFrame.new(threats[k].pos)
+	end
+	setRide(not cutActive)
+	if not ride then avatarCF = nil end
+
+	-- 6) camera anchor, decay
+	camPart.Position = headPos + V(0, 0.8 * L, 0)
+	if ride then lp.CameraMinZoomDistance = clamp(5 * L, 12, 2900) end
+end
+
+local function applyTargets()
+	for _, s in ipairs(slots) do
+		local p = s.p
+		if p.Parent and s.cf then
+			p.CFrame = s.cf
+			p.AssemblyLinearVelocity = V()
+			p.AssemblyAngularVelocity = V()
+		end
+	end
+	if avatarCF and ride and hrp and hrp.Parent then
+		hrp.CFrame = avatarCF
+		hrp.AssemblyLinearVelocity = V()
+		hrp.AssemblyAngularVelocity = V()
+	end
+end
+
+-- GUI ----------------------------------------------------------------------------------------------
+local gui = mk("ScreenGui", {Name = "NoseyBrickGui", ResetOnSpawn = false, DisplayOrder = 50}, guiParent)
+local GOLD, BG, BTN = Color3.fromRGB(222, 180, 110), Color3.fromRGB(22, 20, 24), Color3.fromRGB(58, 52, 60)
+local GREEN, RED, BLUE, ORANGE = Color3.fromRGB(40, 110, 70), Color3.fromRGB(160, 40, 40), Color3.fromRGB(50, 90, 150), Color3.fromRGB(150, 70, 40)
+
+local FULL_H = math.min(430, math.max(240, cam.ViewportSize.Y - 40))
+-- placed on the left edge, next to where the executor's own menu button usually sits; drag the title to move it
+local win = mk("Frame", {Size = UDim2.fromOffset(210, FULL_H), Position = UDim2.new(0, 46, 0.5, -FULL_H / 2),
+	BackgroundColor3 = BG, BorderSizePixel = 0, Active = true}, gui)
+round(win, 12)
+mk("UIStroke", {Color = GOLD, Thickness = 2}, win)
+local title = mk("TextLabel", {Size = UDim2.new(1, -60, 0, 28), Position = UDim2.fromOffset(10, 0), BackgroundTransparency = 1,
+	Text = "NOSEY BRICK", TextColor3 = GOLD, Font = Enum.Font.GothamBold, TextSize = 13, TextXAlignment = Enum.TextXAlignment.Left, Active = true}, win)
+local body = mk("ScrollingFrame", {Size = UDim2.new(1, -8, 1, -34), Position = UDim2.fromOffset(4, 30), BackgroundTransparency = 1,
+	BorderSizePixel = 0, ScrollBarThickness = 4, CanvasSize = UDim2.new()}, win)
+winRef = win
+
+local y = 0
+local function nextRow(h)
+	local r = mk("Frame", {Size = UDim2.new(1, -8, 0, h), Position = UDim2.fromOffset(0, y), BackgroundTransparency = 1}, body)
+	y += h + 6
+	return r
+end
+local function btn(r, text, x, w, cb, color)
+	local b = mk("TextButton", {Size = UDim2.new(w, -3, 1, 0), Position = UDim2.new(x, 1.5, 0, 0), BackgroundColor3 = color or BTN, Text = text,
+		TextColor3 = Color3.new(1, 1, 1), Font = Enum.Font.GothamBold, TextSize = 12, TextWrapped = true}, r)
+	round(b)
+	b.Activated:Connect(function() cb(b) end)
+	return b
+end
+local function box(r, x, w, placeholder, text)
+	local tb = mk("TextBox", {Size = UDim2.new(w, -3, 1, 0), Position = UDim2.new(x, 1.5, 0, 0), BackgroundColor3 = BTN, Text = text or "",
+		PlaceholderText = placeholder, PlaceholderColor3 = Color3.fromRGB(150, 140, 125), TextColor3 = Color3.new(1, 1, 1),
+		Font = Enum.Font.GothamMedium, TextSize = 12, ClearTextOnFocus = false}, r)
+	round(tb)
+	return tb
+end
+local function header(text)
+	local r = nextRow(16)
+	mk("TextLabel", {Size = UDim2.new(1, 0, 1, 0), BackgroundTransparency = 1, Text = text, TextColor3 = GOLD, Font = Enum.Font.GothamBold,
+		TextSize = 12, TextXAlignment = Enum.TextXAlignment.Left}, r)
+end
+
+local summonBtn, controlBtn, nameBox, speedBox, infoLbl
+local syncButtons = function() end
+
+local function countBricks()
+	local ok, list, dims = pcall(gather)
+	if not ok or not list then
+		infoLbl.Text = string.format("Needs %d bricks (1x1x3). %s", NEED, ok and tostring(dims) or "scan failed")
+		return
+	end
+	infoLbl.Text = string.format("Needs %d bricks (1x1x3).\nFound %d of %.0fx%.0fx%.0f %s", NEED, #list, dims[1], dims[2], dims[3],
+		#list >= NEED and "- OK" or "- not enough")
+end
+local function toggleSummon()
+	if alive then dismiss() else summon() end
+	syncButtons()
+end
+local function toggleControl()
+	if not alive or cutActive then notify("Spawn first", 3) return end
+	control = not control
+	if control then targetPl = nil end
+	notify(control and "CONTROL on - move with your normal controls, abilities on buttons / R F G V" or "Control off", 4)
+	syncButtons()
+end
+local function targetTyped()
+	if not alive or cutActive then notify("Spawn first", 3) return end
+	if hidden then notify("Press Disappear to come back first", 3) return end
+	if control then notify("Turn Control off first", 3) return end
+	if nameBox.Text:match("^%s*$") then notify("Type a player name first", 3) return end
+	local pl = findPlayer(nameBox.Text)
+	if not pl then notify("Player not found: " .. nameBox.Text, 3) return end
+	if not targetHrp(pl) then notify("That player has no character", 3) return end
+	targetPl = pl
+	setGlow("Anger")
+	notify("Targeting: " .. pl.DisplayName, 4)
+end
+local function stopTarget()
+	targetPl = nil
+	if alive and not act and not cutActive then setGlow(baseGlow()) end
+	notify("Target cleared", 2)
+end
+local function applySpeed()
+	local n = tonumber((speedBox.Text:gsub("[^%d%.]", "")))
+	if not n then
+		notify("Type a speed number, e.g. 80", 3)
+		speedBox.Text = tostring(SPEED)
+		return
+	end
+	SPEED = clamp(n, 1, 1000)
+	speedBox.Text = tostring(SPEED)
+	notify("Speed " .. SPEED, 2)
+end
+local function unload()
+	for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
+	pcall(function() RunService:UnbindFromRenderStep("NoseyShake") end)
+	dismiss()
+	gui:Destroy()
+	cine:Destroy()
+	_G.NoseyBrick = nil
+end
+_G.NoseyBrick = unload
+
+do
+	summonBtn = btn(nextRow(30), "Spawn", 0, 1, toggleSummon, GREEN)
+	controlBtn = btn(nextRow(28), "Control: OFF", 0, 1, toggleControl)
+	local rs = nextRow(24)
+	mk("TextLabel", {Size = UDim2.new(0.38, 0, 1, 0), BackgroundTransparency = 1, Text = "Speed", TextColor3 = Color3.new(1, 1, 1),
+		Font = Enum.Font.GothamMedium, TextSize = 12, TextXAlignment = Enum.TextXAlignment.Left}, rs)
+	speedBox = box(rs, 0.38, 0.62, "any number", tostring(SPEED))
+	speedBox.FocusLost:Connect(applySpeed)
+	header("Target player")
+	nameBox = box(nextRow(24), 0, 1, "Type player name")
+	local rt = nextRow(28)
+	btn(rt, "Target", 0, 0.5, targetTyped, RED)
+	btn(rt, "Stop", 0.5, 0.5, stopTarget, BLUE)
+	header("Abilities")
+	local a1, a2 = nextRow(28), nextRow(28)
+	btn(a1, "Punch (F)", 0, 0.5, function() runSkill("Punch", targetPl) end, ORANGE)
+	btn(a1, "Roar (R)", 0.5, 0.5, function() runSkill("Roar") end, ORANGE)
+	btn(a2, "Slam (G)", 0, 0.5, function() runSkill("Slam") end, ORANGE)
+	btn(a2, "Disappear (V)", 0.5, 0.5, function() runSkill("Disappear") end, Color3.fromRGB(70, 50, 100))
+	local ri = nextRow(40)
+	infoLbl = mk("TextLabel", {Size = UDim2.new(1, -8, 1, 0), BackgroundColor3 = Color3.fromRGB(32, 29, 34), Text = "", TextColor3 = Color3.new(1, 1, 1),
+		Font = Enum.Font.Code, TextSize = 11, TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top}, ri)
+	round(infoLbl)
+	btn(nextRow(24), "Check bricks", 0, 1, countBricks)
+	btn(nextRow(24), "Unload script", 0, 1, function() unload() end, RED)
+end
+statusLbl = mk("TextLabel", {Size = UDim2.new(1, -8, 0, 54), Position = UDim2.fromOffset(0, y), BackgroundTransparency = 1, Text = "",
+	TextColor3 = Color3.fromRGB(190, 175, 150), Font = Enum.Font.Gotham, TextSize = 10, TextWrapped = true,
+	TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top}, body)
+body.CanvasSize = UDim2.fromOffset(0, y + 62)
+
+syncButtons = function()
+	summonBtn.Text = alive and "Dismiss" or "Spawn"
+	summonBtn.BackgroundColor3 = alive and RED or GREEN
+	controlBtn.Text = "Control: " .. (control and "ON" or "OFF")
+	controlBtn.BackgroundColor3 = control and GREEN or BLUE
+end
+
+local function headerBtn(text, x, cb)
+	local b = mk("TextButton", {Size = UDim2.fromOffset(22, 20), Position = UDim2.new(1, x, 0, 4), BackgroundColor3 = BTN, Text = text,
+		TextColor3 = Color3.new(1, 1, 1), Font = Enum.Font.GothamBold, TextSize = 14}, win)
+	round(b, 6)
+	b.Activated:Connect(cb)
+end
+local minimized = false
+headerBtn("-", -48, function()
+	minimized = not minimized
+	body.Visible = not minimized
+	win.Size = UDim2.fromOffset(210, minimized and 28 or FULL_H)
+end)
+headerBtn("x", -25, function() win.Visible = false end)
+local openBtn = mk("TextButton", {Size = UDim2.fromOffset(34, 34), Position = UDim2.new(0, 6, 0.5, -17), BackgroundColor3 = BG, Text = "N",
+	TextColor3 = GOLD, Font = Enum.Font.GothamBlack, TextSize = 16, ZIndex = 5}, gui)
+round(openBtn, 17)
+mk("UIStroke", {Color = GOLD, Thickness = 2}, openBtn)
+openBtn.Activated:Connect(function() win.Visible = not win.Visible end)
+openRef = openBtn
+
+do -- drag by title
+	local dragging, startPos, startIn
+	title.InputBegan:Connect(function(i)
+		if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+			dragging, startPos, startIn = true, win.Position, i.Position
+		end
+	end)
+	table.insert(conns, UIS.InputChanged:Connect(function(i)
+		if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
+			local d = i.Position - startIn
+			win.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+		end
+	end))
+	table.insert(conns, UIS.InputEnded:Connect(function(i)
+		if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then dragging = false end
+	end))
+end
+
+-- input / loops ------------------------------------------------------------------------------------
+table.insert(conns, UIS.InputBegan:Connect(function(i, gp)
+	if gp then return end
+	local k = i.KeyCode
+	if k == Enum.KeyCode.RightControl then win.Visible = not win.Visible
+	elseif k == Enum.KeyCode.R then runSkill("Roar")
+	elseif k == Enum.KeyCode.F then runSkill("Punch", targetPl)
+	elseif k == Enum.KeyCode.G then runSkill("Slam")
+	elseif k == Enum.KeyCode.V then runSkill("Disappear") end
+end))
+table.insert(conns, lp.CharacterAdded:Connect(function(c)
+	refChar(c)
+	if alive then
+		refreshFilters()
+		if ride then carryAvatar(true); cam.CameraSubject = camPart end
+	end
+end))
+table.insert(conns, RunService.RenderStepped:Connect(function(dt)
+	if alive and camPart then
+		local ok, err = pcall(step, math.min(dt, 0.033))
+		if not ok then
+			errT += dt
+			if errT > 0.5 then errT = 0; notify("script error: " .. tostring(err), 6); warn("[NoseyBrick] " .. tostring(err)) end
+		end
+		filT += dt
+		if filT > 2then filT = 0; refreshFilters() end
+	end
+	statT += dt
+	if statT > 0.5 then
+		statT = 0
+		syncButtons()
+		if os.clock() > noticeUntil then
+			if alive then
+				local st = act and act:upper() or (hidden and "Hidden") or (targetPl and ("Targeting " .. targetPl.DisplayName)) or (control and "Controlled") or "Idle"
+				statusLbl.Text = string.format("%s | %d bricks | speed %g", st, NEED, SPEED)
+			else
+				statusLbl.Text = "Ready | uses exactly " .. NEED .. " of your 1x1x3 bricks"
+			end
+		end
+	end
+end))
+table.insert(conns, RunService.Heartbeat:Connect(function() if alive then applyTargets() end end))
+table.insert(conns, RunService.Stepped:Connect(function() if alive then applyTargets() end end))
+
+pcall(countBricks)
+print("[NOSEY BRICK] loaded - nothing moves until you press Spawn")

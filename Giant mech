@@ -1,0 +1,2155 @@
+--[[ TITAN GIANT MECH  -  FE brick mech (Delta / any executor)
+  * Built ONLY from your own unanchored, unwelded 1x1x3 bricks. 100 minimum, 300 maximum.
+    Builds the biggest version your count allows:  100 | 180 | 220 | 285 | 300
+  * Every brick is pinned to the rig every frame (CFrame + anti-gravity force) so nothing ever falls.
+  * SIZE 1x - 10x: the rig scales up and the bricks spread out (brick size cannot be changed from the
+    client), so big sizes look like a floating "constellation" mech. 1x-3x looks the most solid.
+  * Magazine = 10 bricks on the back pods. They are the missiles AND the laser beam.
+  * Sword (20-ish bricks) is stowed on the back; EQUIP draws it. All projectiles are non-colliding (no damage / no knockback).
+
+  ABILITIES  (button / key)
+    sword OFF : Shot [Q] (10 ammo + Reload [T]) | Punch [F] | Roar [R] | Slam [G]
+    sword ON  : Spin [Q] | Slash [F] | Pose [R] | Slam [G]
+    always    : Laser [L] | Equip sword [E] | Reload [T]
+  GUI: "M" button or RightControl toggles the panel; drag by the title.
+  FE : positions / animation / flying bricks are seen by everyone. Colors, glow, cutscene, effects are local only.
+       Tip: paint your bricks with the game's paint tool first if you want others to see a colored mech.
+]]
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UIS = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local Lighting = game:GetService("Lighting")
+local Debris = game:GetService("Debris")
+local lp = Players.LocalPlayer
+local cam = workspace.CurrentCamera
+
+if _G.NoseyBrick then pcall(_G.NoseyBrick) end
+
+local V = Vector3.new
+local TAU = math.pi * 2
+local WANT_LONG = 3
+
+-- palette ----------------------------------------------------------------------------------------
+local ARMOR, BLUE, RED = Color3.fromRGB(200, 204, 214), Color3.fromRGB(40, 80, 170), Color3.fromRGB(175, 40, 40)
+local GOLD, STEEL, DARKM = Color3.fromRGB(225, 180, 60), Color3.fromRGB(70, 74, 84), Color3.fromRGB(34, 36, 42)
+local ORANGE_C, BLADE_OFF, BLADE_ON = Color3.fromRGB(230, 120, 30), Color3.fromRGB(190, 205, 220), Color3.fromRGB(120, 235, 255)
+local GLOW = {Offline = Color3.fromRGB(15, 15, 15), Online = Color3.fromRGB(110, 235, 255), Anger = Color3.fromRGB(255, 40, 40)}
+
+-- state ----------------------------------------------------------------------------------------
+local char, hrp, hum
+local alive, ride = false, false
+local pool, slots, saved = {}, {}, {}
+local bones, order, parts = {}, {}, {}
+local geo, tplCur, tierCur, curNeed = nil, nil, nil, 0
+local Lb, cxb, czb = 3, 1, 1 -- real brick length / width / depth
+local sc, scTarget = 1, 1
+local L = 3 -- scaled brick length
+local hp, gy, heading = V(), 0, 0
+local SPEED = 30
+local curSp, wavePh, lastCwPos = 0, 0, true
+local crouch, crouchTarget, crouchRate = 0, 0, 4
+local act, busy, control, targetPl, faceTarget = nil, false, false, nil, nil
+local punchCd, dashT, dashSpd = 0, 0, 0
+local glowMode = "Offline"
+local cutActive, skipFlag = false, false
+local shakeAmp, shakeEnd = 0, 0
+local avatarCF, avatarSaved = nil, {}
+local headPos, torsoPos, handPos, footPos = V(), V(), V(), V()
+local camPart, flamePart, trailPart
+local oldZoomMax, oldZoomMin, baseFov = 128, 0.5, 70
+local statusLbl, noticeUntil = nil, 0
+local conns = {}
+local radT, guardT, threats, statT, filT, errT = 0, 0, {}, 0, 0, 0
+local controls
+local equipped, swordEq, swordTarget = false, 0, 0
+local A, ammoSlots = {}, {}
+local laser, laserOrb, laserBeam = nil, nil, nil
+local recoil, hop, hopT = 0, 0, 0
+local fall = {y = 0, vy = 0, active = false, landed = false, phase = 1, g = 0, hb = 0, v1 = 0, landT = 0}
+local reloadAuto = 0
+local shotCd, aiShotT, aiLaserT = 0, 0, 6
+local debrisList = {}
+local groundP = RaycastParams.new()
+groundP.FilterType = Enum.RaycastFilterType.Exclude
+groundP.RespectCanCollide = true
+
+pcall(function()
+	controls = require(lp:WaitForChild("PlayerScripts"):WaitForChild("PlayerModule", 3)):GetControls()
+end)
+
+local function clamp(x, a, b) return math.clamp(x, a, b) end
+local function smooth(x) x = clamp(x, 0, 1); return x * x * (3 - 2 * x) end
+local function mix(a, b, k) return a + (b - a) * k end
+local function adiff(a, b) return (a - b + math.pi) % TAU - math.pi end
+
+local function notify(txt, secs)
+	if statusLbl then statusLbl.Text = txt end
+	noticeUntil = os.clock() + (secs or 3)
+end
+local function refChar(c)
+	char = c
+	hrp = c:WaitForChild("HumanoidRootPart")
+	hum = c:WaitForChild("Humanoid")
+end
+refChar(lp.Character or lp.CharacterAdded:Wait())
+
+-- body templates ({wide, deep, tall-layers}) ---------------------------------------------------------------
+local TEMPLATES = {
+	S = {foot = {2, 2, 1}, shin = {1, 2, 2}, thigh = {2, 2, 1}, hip = {4, 2, 1}, abd = {2, 2, 1}, chest = {4, 2, 1}, head = {2, 2, 1},
+		uarm = {1, 2, 1}, fore = {1, 2, 1}, fist = {1, 1, 1}, pack = nil, fins = 1, sword = {1, 6, 1, 1}, tube = false},
+	M = {foot = {2, 3, 1}, shin = {2, 2, 3}, thigh = {2, 2, 2}, hip = {4, 2, 1}, abd = {2, 2, 1}, chest = {5, 3, 2}, head = {2, 2, 2},
+		uarm = {2, 2, 2}, fore = {2, 2, 2}, fist = {2, 2, 1}, pack = {3, 1, 2}, fins = 2, sword = {2, 6, 2, 1}, tube = true},
+	XL = {foot = {2, 4, 1}, shin = {2, 3, 3}, thigh = {3, 3, 2}, hip = {6, 3, 1}, abd = {3, 3, 1}, chest = {6, 4, 2}, head = {3, 3, 2},
+		uarm = {3, 3, 2}, fore = {3, 3, 2}, fist = {3, 3, 1}, pack = {4, 2, 2}, fins = 2, sword = {2, 8, 2, 1}, tube = true},
+}
+local TIERS = {
+	{tpl = "S", target = 100}, {tpl = "M", target = 180}, {tpl = "M", target = 220},
+	{tpl = "XL", target = 285}, {tpl = "XL", target = 300},
+}
+local function partCount(pt)
+	local n = pt.nx * pt.nz * pt.ny
+	if pt.tube then n -= math.max(pt.nx - 2, 0) * math.max(pt.nz - 2, 0) * pt.ny end
+	return n
+end
+
+-- layout: bones, parts, geometry, number of spare "needle" slots --------------------------------------------
+local function layout(cxx, czz, LL, tname, fill)
+	local T = TEMPLATES[tname]
+	local b, o, p = {}, {}, {}
+	local function bone(n, par, pv) b[n] = {parent = par, pv = pv}; o[#o + 1] = n end
+	local function part(bn, c, dims, kind, e)
+		e = e or {}
+		p[#p + 1] = {bone = bn, c = c, nx = dims[1], nz = dims[2], ny = dims[3], kind = kind, tube = e.tube, rot = e.rot, ammo = e.ammo}
+	end
+	local fo, sh, th = T.foot[3], T.shin[3], T.thigh[3]
+	local hipH, abH, ch, hh = T.hip[3], T.abd[3], T.chest[3], T.head[3]
+	local yKnee = fo + sh
+	local yTh = yKnee + th
+	local yWa = yTh + hipH
+	local yAb = yWa + abH
+	local yCh = yAb + ch
+	local yHd = yCh + hh
+	local legX = T.thigh[1] * cxx / 2
+	local chestHalf = T.chest[1] * cxx / 2
+	local armX = chestHalf + T.uarm[1] * cxx / 2
+	local uaN, foN, fiN = T.uarm[3], T.fore[3], T.fist[3]
+	local yFore = yCh - uaN
+	local yFist = yFore - foN
+	local tube = T.tube
+	local sw = T.sword
+
+	bone("Root", nil, V(0, yTh * LL, 0))
+	bone("Torso", "Root", V(0, yWa * LL, 0))
+	bone("Head", "Torso", V(0, yCh * LL, 0))
+	part("Root", V(0, (yTh + hipH / 2) * LL, 0), T.hip, "hip", {tube = tube})
+	part("Torso", V(0, (yWa + abH / 2) * LL, 0), T.abd, "abd", {tube = tube})
+	part("Torso", V(0, (yAb + ch / 2) * LL, 0), T.chest, "chest", {tube = tube})
+	part("Head", V(0, (yCh + hh / 2) * LL, 0), T.head, "head", {tube = tube})
+
+	local chBack = T.chest[2] * czz / 2
+	local packZ = chBack
+	local packN = 0
+	if T.pack then
+		part("Torso", V(0, (yAb + T.pack[3] / 2) * LL, chBack + T.pack[2] * czz / 2), T.pack, "pack")
+		packZ = chBack + T.pack[2] * czz
+		packN = T.pack[3]
+	end
+	-- ammo pods: 10 vertical launchers behind the shoulders
+	local podY = (yAb + packN + 0.5) * LL
+	local ai = 0
+	for k = 1, 2 do
+		for i = 1, 5 do
+			ai += 1
+			part("Torso", V((i - 3) * cxx, podY, packZ + (k - 0.5) * czz), {1, 1, 1}, "ammo", {ammo = ai})
+		end
+	end
+
+	for _, s in ipairs({-1, 1}) do
+		local d = s < 0 and "L" or "R"
+		bone("Thigh" .. d, "Root", V(s * legX, yTh * LL, 0))
+		bone("Shin" .. d, "Thigh" .. d, V(s * legX, yKnee * LL, 0))
+		bone("Foot" .. d, "Shin" .. d, V(s * legX, fo * LL, 0))
+		part("Thigh" .. d, V(s * legX, (yKnee + th / 2) * LL, 0), T.thigh, "thigh", {tube = tube})
+		part("Shin" .. d, V(s * legX, (fo + sh / 2) * LL, 0), T.shin, "shin", {tube = tube})
+		part("Foot" .. d, V(s * legX, (fo / 2) * LL, -(T.foot[2] - T.shin[2]) * czz / 2), T.foot, "foot")
+		bone("Arm" .. d, "Torso", V(s * armX, yCh * LL, 0))
+		bone("Fore" .. d, "Arm" .. d, V(s * armX, yFore * LL, 0))
+		bone("Hand" .. d, "Fore" .. d, V(s * armX, yFist * LL, 0))
+		part("Arm" .. d, V(s * armX, (yCh - uaN / 2) * LL, 0), T.uarm, "arm", {tube = tube})
+		part("Fore" .. d, V(s * armX, (yFore - foN / 2) * LL, 0), T.fore, "fore", {tube = tube})
+		part("Hand" .. d, V(s * armX, (yFist - fiN / 2) * LL, 0), T.fist, "fist", {tube = tube})
+		for n = 1, T.fins do
+			local tilt = 0.45 + 0.35 * (n - 1)
+			local pvx, pvy, pvz = s * (T.head[1] * cxx / 2), (yCh + hh * 0.65) * LL, (0.3 + (n - 1) * 0.8) * czz
+			bone("Fin" .. d .. n, "Head", V(pvx, pvy, pvz))
+			part("Fin" .. d .. n, V(pvx + s * math.sin(tilt) * LL / 2, pvy + math.cos(tilt) * LL / 2, pvz), {1, 1, 1}, "fin",
+				{rot = CFrame.Angles(0, 0, -s * tilt)})
+		end
+	end
+
+	-- sword (own local space, origin = hilt centre, blade along +Y)
+	bone("Sword", nil, V(0, 0, 0))
+	part("Sword", V(0, 0, 0), {1, 1, 1}, "hilt")
+	for g = 1, sw[3] do
+		part("Sword", V((g - (sw[3] + 1) / 2) * LL, LL / 2 + 0.5 * cxx, 0), {1, 1, 1}, "guard", {rot = CFrame.Angles(0, 0, math.pi / 2)})
+	end
+	local bladeY0 = LL / 2 + cxx
+	part("Sword", V(0, bladeY0 + sw[2] * LL / 2, 0), {sw[1], 1, sw[2]}, "blade")
+
+	-- needle / fin filler bricks (priority ordered) -------------------------------------------------------
+	local C = {}
+	local function sideSpike(bn, s, xE, y, z, u)
+		local dir = V(s * math.cos(u), math.sin(u), 0)
+		C[#C + 1] = {bone = bn, c = V(s * xE, y, z) + dir * (LL / 2), rot = CFrame.Angles(0, 0, -s * (math.pi / 2 - u))}
+	end
+	local function backSpike(bn, x, y, zE, sgn, u)
+		local dir = V(0, math.sin(u), sgn * math.cos(u))
+		C[#C + 1] = {bone = bn, c = V(x, y, sgn * zE) + dir * (LL / 2), rot = CFrame.Angles(sgn * (math.pi / 2 - u), 0, 0)}
+	end
+	local function upSpike(bn, s, x, y, z, tilt)
+		local dir = V(s * math.sin(tilt), math.cos(tilt), 0)
+		C[#C + 1] = {bone = bn, c = V(x, y, z) + dir * (LL / 2), rot = CFrame.Angles(0, 0, -s * tilt)}
+	end
+	local uNx, uD = T.uarm[1], T.uarm[2]
+	local foNx, foD = T.fore[1], T.fore[2]
+	local hdNx, hdD = T.head[1], T.head[2]
+	local thNx, thD = T.thigh[1], T.thigh[2]
+	local shNx, shD = T.shin[1], T.shin[2]
+	local hpNx, hpD = T.hip[1], T.hip[2]
+	local abNx, abD = T.abd[1], T.abd[2]
+	for r = 1, uaN do -- shoulder spikes
+		for kz = 1, uD do
+			for _, s in ipairs({-1, 1}) do
+				local d = s < 0 and "L" or "R"
+				sideSpike("Arm" .. d, s, armX + uNx * cxx / 2, (yCh - r + 0.5) * LL, (kz - 0.5 - uD / 2) * czz, ((kz + r) % 2 == 0) and 0.3 or -0.1)
+			end
+		end
+	end
+	for _, s in ipairs({-1, 1}) do -- shoulder crown
+		local d = s < 0 and "L" or "R"
+		for _, zz in ipairs({-1, 1}) do
+			upSpike("Arm" .. d, s, s * armX, yCh * LL, zz * (uD * czz / 2 - 0.5 * czz), 0.25)
+		end
+	end
+	for r = 1, foN do -- forearm blades
+		for i = 1, foNx do
+			for _, s in ipairs({-1, 1}) do
+				local d = s < 0 and "L" or "R"
+				backSpike("Fore" .. d, s * armX + (i - 0.5 - foNx / 2) * cxx, (yFore - r + 0.5) * LL, foD * czz / 2, 1, 0.2)
+			end
+		end
+	end
+	for r = 1, foN do
+		for _, s in ipairs({-1, 1}) do
+			local d = s < 0 and "L" or "R"
+			sideSpike("Fore" .. d, s, armX + foNx * cxx / 2, (yFore - r + 0.5) * LL, 0, 0.1)
+		end
+	end
+	for k = 1, hdD do -- head crown + cheek blades
+		for _, s in ipairs({-1, 1}) do
+			sideSpike("Head", s, hdNx * cxx / 2, (yHd - 0.5) * LL, (k - 0.5 - hdD / 2) * czz, 0.7)
+		end
+	end
+	for k = 1, hdD do
+		for _, s in ipairs({-1, 1}) do
+			sideSpike("Head", s, hdNx * cxx / 2, (yCh + 0.5) * LL, (k - 0.5 - hdD / 2) * czz, 0.3)
+		end
+	end
+	for i = 1, hdNx do
+		backSpike("Head", (i - 0.5 - hdNx / 2) * cxx, (yHd - 0.5) * LL, hdD * czz / 2, 1, 0.5)
+	end
+	for r = 1, math.min(sh, 2) do -- knee spikes
+		for i = 1, shNx do
+			for _, s in ipairs({-1, 1}) do
+				local d = s < 0 and "L" or "R"
+				backSpike("Shin" .. d, s * legX + (i - 0.5 - shNx / 2) * cxx, (fo + sh - r + 0.5) * LL, shD * czz / 2, -1, 0.1)
+			end
+		end
+	end
+	for r = 1, hipH do -- hip skirt
+		for k = 1, hpD do
+			for _, s in ipairs({-1, 1}) do
+				sideSpike("Root", s, hpNx * cxx / 2, (yTh + r - 0.5) * LL, (k - 0.5 - hpD / 2) * czz, -0.15)
+			end
+		end
+	end
+	for r = 1, abH do
+		for k = 1, abD do
+			for _, s in ipairs({-1, 1}) do
+				sideSpike("Torso", s, abNx * cxx / 2, (yWa + r - 0.5) * LL, (k - 0.5 - abD / 2) * czz, 0.0)
+			end
+		end
+	end
+	for r = 1, th do
+		for k = 1, thD do
+			for _, s in ipairs({-1, 1}) do
+				local d = s < 0 and "L" or "R"
+				sideSpike("Thigh" .. d, s, legX + thNx * cxx / 2, (yKnee + r - 0.5) * LL, (k - 0.5 - thD / 2) * czz, 0.05)
+			end
+		end
+	end
+	for r = 1, sh do
+		for k = 1, shD do
+			for _, s in ipairs({-1, 1}) do
+				local d = s < 0 and "L" or "R"
+				sideSpike("Shin" .. d, s, legX + shNx * cxx / 2, (fo + r - 0.5) * LL, (k - 0.5 - shD / 2) * czz, -0.1)
+			end
+		end
+	end
+	for i = 1, math.min(fill or 0, #C) do
+		local sp = C[i]
+		part(sp.bone, sp.c, {1, 1, 1}, "spike", {rot = sp.rot})
+	end
+
+	local g = {
+		height = (yHd + 1.1) * LL,
+		thighLen = th * LL, shinLen = sh * LL, footH = fo * LL,
+		headY = (yCh + hh / 2) * LL, torsoY = (yAb + ch / 2) * LL,
+		fistHalf = fiN / 2 * LL,
+		stowRel = CFrame.new(chestHalf * 0.45, 0.4 * LL, packZ + 3 * czz) * CFrame.Angles(0, 0, 0.3),
+		muzzleRel = V(0, (yAb + ch / 2 - yWa) * LL, -(T.chest[2] * czz / 2) - 0.6 * cxx),
+		bladeLen = sw[2] * LL, bladeY0 = bladeY0,
+	}
+	return b, o, p, g, #C
+end
+
+for _, tr in ipairs(TIERS) do
+	local _, _, p, _, nc = layout(1, 1, 3, tr.tpl, 0)
+	local base = 0
+	for _, pt in ipairs(p) do base += partCount(pt) end
+	tr.base, tr.cands = base, nc
+	tr.need = math.min(tr.target, base + nc)
+end
+local NEED_MIN, NEED_MAX = TIERS[1].need, TIERS[#TIERS].need
+local function planTier(avail)
+	local best
+	for _, tr in ipairs(TIERS) do
+		if tr.need <= avail then best = tr end
+	end
+	return best
+end
+
+-- colors per cell: returns color, glowGroup ("eye" / "core" / "blade")
+local function slotStyle(kind, i, k, j, nx, ny)
+	if kind == "head" then
+		if k == 1 and (ny == 1 or j == ny) then return GLOW.Offline, "eye" end
+		if j == 1 and ny > 1 then return STEEL end
+		return ARMOR
+	elseif kind == "chest" then
+		if k == 1 and j == 1 and (i == math.ceil(nx / 2) or i == math.floor(nx / 2) + 1) then return GLOW.Offline, "core" end
+		if k == 1 then return BLUE end
+		if i == 1 or i == nx then return STEEL end
+		return ARMOR
+	elseif kind == "abd" then return STEEL
+	elseif kind == "hip" then
+		if k == 1 and (i == math.ceil(nx / 2) or i == math.floor(nx / 2) + 1) then return GOLD end
+		return ARMOR
+	elseif kind == "thigh" then return ARMOR
+	elseif kind == "shin" then
+		if j == ny then return RED end
+		return ARMOR
+	elseif kind == "foot" then return BLUE
+	elseif kind == "arm" then
+		if j == ny then return RED end
+		return ARMOR
+	elseif kind == "fore" then
+		if j == 1 and ny > 1 then return GOLD end
+		return BLUE
+	elseif kind == "fist" then return STEEL
+	elseif kind == "pack" then return DARKM
+	elseif kind == "ammo" then return ORANGE_C
+	elseif kind == "fin" then return GOLD
+	elseif kind == "hilt" then return DARKM
+	elseif kind == "guard" then return GOLD
+	elseif kind == "blade" then return BLADE_OFF, "blade"
+	end
+	return STEEL
+end
+
+-- owner / brick detection ---------------------------------------------------------------------------
+local function ownerState(p)
+	local function match(v)
+		if v == nil then return nil end
+		if typeof(v) == "Instance" then v = v.Name end
+		if type(v) == "number" then return v == lp.UserId end
+		v = tostring(v):lower()
+		return v == lp.Name:lower() or v == lp.DisplayName:lower() or v == tostring(lp.UserId)
+	end
+	local inst = p
+	for _ = 1, 4 do
+		if not inst or inst == workspace then break end
+		for _, nm in ipairs({"Owner", "owner", "Creator", "creator", "Player", "Builder"}) do
+			local a = inst:GetAttribute(nm)
+			if a ~= nil then return match(a) end
+			local c = inst:FindFirstChild(nm)
+			if c and c:IsA("ValueBase") then return match(c.Value) end
+		end
+		local pl = Players:FindFirstChild(inst.Name)
+		if pl and pl:IsA("Player") then return pl == lp end
+		inst = inst.Parent
+	end
+	return nil
+end
+local function usable(p)
+	if not p or not p.Parent or p:IsDescendantOf(char) then return false end
+	if p.Anchored then return false end
+	local okJ, joints = pcall(function() return p:GetJoints() end)
+	if okJ and #joints > 0 then return false end
+	if ownerState(p) == false then return false end
+	if isnetworkowner then
+		local okO, own = pcall(isnetworkowner, p)
+		if okO and not own then return false end
+	end
+	return true
+end
+local function gather()
+	local root = workspace:FindFirstChild("Bricks")
+	if not root then return nil, "workspace.Bricks not found" end
+	local groups, base = {}, hrp.Position
+	for _, d in ipairs(root:GetDescendants()) do
+		if d:IsA("BasePart") and usable(d) then
+			local s = d.Size
+			local a = {s.X, s.Y, s.Z}
+			table.sort(a)
+			local key = string.format("%.2f,%.2f,%.2f", a[1], a[2], a[3])
+			local g = groups[key]
+			if not g then g = {dims = a, list = {}}; groups[key] = g end
+			g.list[#g.list + 1] = {d, (d.Position - base).Magnitude, ownerState(d) == true and 0 or 1}
+		end
+	end
+	local best, bestScore
+	for _, g in pairs(groups) do
+		local score = #g.list
+		if math.abs(g.dims[3] - WANT_LONG) < 0.3 then score += 1e6 end
+		if not bestScore or score > bestScore then best, bestScore = g, score end
+	end
+	if not best then return nil, "no free bricks found" end
+	table.sort(best.list, function(x, y)
+		if x[3] ~= y[3] then return x[3] < y[3] end
+		return x[2] < y[2]
+	end)
+	return best.list, best.dims
+end
+local function orientFor(p)
+	local s = p.Size
+	local sz = {s.X, s.Y, s.Z}
+	local idx = {1, 2, 3}
+	table.sort(idx, function(a, b) return sz[a] < sz[b] end)
+	local ax = {}
+	ax[idx[1]], ax[idx[2]], ax[idx[3]] = V(1, 0, 0), V(0, 0, 1), V(0, 1, 0)
+	return CFrame.fromMatrix(V(), ax[1], ax[2])
+end
+
+local function groundAt(p, h)
+	local res = workspace:Raycast(p + V(0, h, 0), V(0, -(h + 6000), 0), groundP)
+	return res and res.Position.Y or p.Y
+end
+local function refreshFilters()
+	local f = {char}
+	if camPart then f[#f + 1] = camPart end
+	for _, p in ipairs(pool) do f[#f + 1] = p end
+	for _, pl in ipairs(Players:GetPlayers()) do
+		if pl.Character then f[#f + 1] = pl.Character end
+	end
+	groundP.FilterDescendantsInstances = f
+end
+
+-- glow (local colour only) ---------------------------------------------------------------------------
+local function setGlow(mode)
+	glowMode = mode
+	for _, s in ipairs(slots) do
+		if (s.gl == "eye" or s.gl == "core") and s.p.Parent then
+			pcall(function()
+				s.p.Color = GLOW[mode]
+				s.p.Material = (mode == "Offline") and Enum.Material.SmoothPlastic or Enum.Material.Neon
+			end)
+		end
+	end
+end
+local function setBlade(on)
+	for _, s in ipairs(slots) do
+		if s.gl == "blade" and s.p.Parent then
+			pcall(function()
+				s.p.Color = on and BLADE_ON or BLADE_OFF
+				s.p.Material = on and Enum.Material.Neon or Enum.Material.Metal
+			end)
+		end
+	end
+end
+local function baseGlow() return targetPl and "Anger" or "Online" end
+
+-- avatar rides inside the body so the bricks stay yours ------------------------------------------------
+local function carryAvatar(on)
+	if on then
+		pcall(function() hrp.Anchored = false end)
+		pcall(function() hum.PlatformStand = true end)
+		avatarSaved = {}
+		for _, d in ipairs(char:GetDescendants()) do
+			if d:IsA("BasePart") then avatarSaved[d] = d.CanCollide; d.CanCollide = false end
+		end
+		pcall(function()
+			local old = hrp:FindFirstChild("NoseyAvatarAntiG")
+			if old then old:Destroy() end
+			local bf = Instance.new("BodyForce")
+			bf.Name = "NoseyAvatarAntiG"
+			bf.Force = V(0, hrp.AssemblyMass * workspace.Gravity, 0)
+			bf.Parent = hrp
+		end)
+	else
+		pcall(function() local bf = hrp:FindFirstChild("NoseyAvatarAntiG"); if bf then bf:Destroy() end end)
+		for d, c in pairs(avatarSaved) do pcall(function() d.CanCollide; d.CanCollide = false end
+		end
+		pcall(function()
+			local old = hrp:FindFirstChild("NoseyAvatarAntiG")
+			if old then old:Destroy() end
+			local bf = Instance.new("BodyForce")
+			bf.Name = "NoseyAvatarAntiG"
+			bf.Force = V(0, hrp.AssemblyMass * workspace.Gravity, 0)
+			bf.Parent = hrp
+		end)
+	else
+		pcall(function() local bf = hrp:FindFirstChild("NoseyAvatarAntiG"); if bf then bf:Destroy() end end)
+		for d, c in pairs(avatarSaved) do pcall(function() d.CanCollide = c end) end
+		avatarSaved = {}
+		pcall(function() hum.PlatformStand = false end)
+		pcall(function() hrp.AssemblyLinearVelocity = V() end)
+	end
+end
+local function setRide(on)
+	if on == ride then return end
+	ride = on
+	carryAvatar(on)
+	if on then
+		cam.CameraSubject = camPart
+		lp.CameraMaxZoomDistance = 6000
+		lp.CameraMinZoomDistance = clamp(geo and geo.height * 0.7 or 20, 12, 5000)
+	else
+		pcall(function() hrp.CFrame = CFrame.new(hp.X, gy + 8, hp.Z) end)
+		avatarCF = nil
+		cam.CameraSubject = hum
+		lp.CameraMaxZoomDistance, lp.CameraMinZoomDistance = oldZoomMax, oldZoomMin
+	end
+end
+
+-- local effects --------------------------------------------------------------------------------------
+RunService:BindToRenderStep("NoseyShake", Enum.RenderPriority.Camera.Value + 1, function()
+	local left = shakeEnd - os.clock()
+	if left > 0 and not cutActive then
+		local a = shakeAmp * math.min(1, left)
+		cam.CFrame = cam.CFrame * CFrame.new((math.random() - 0.5) * a, (math.random() - 0.5) * a, 0)
+			* CFrame.Angles(0, 0, (math.random() - 0.5) * a * 0.02)
+	end
+end)
+local function shakeFrom(pos, power, secs, range)
+	local k = clamp(1 - (cam.CFrame.Position - pos).Magnitude / range, 0, 1)
+	if k > 0 then shakeAmp, shakeEnd = power * k * math.max(1, math.sqrt(sc)), os.clock() + secs end
+end
+local function shockwave(pos, radius, color)
+	local p = Instance.new("Part")
+	p.Anchored, p.CanCollide, p.CanQuery, p.CanTouch = true, false, false, false
+	p.Shape = Enum.PartType.Cylinder
+	p.Material = Enum.Material.Neon
+	p.Color = color or Color3.fromRGB(255, 120, 60)
+	p.Transparency = 0.35
+	p.Size = V(math.max(0.4, radius * 0.02), 2, 2)
+	p.CFrame = CFrame.new(pos + V(0, 0.3, 0)) * CFrame.Angles(0, 0, math.pi / 2)
+	p.Parent = workspace
+	TweenService:Create(p, TweenInfo.new(0.8, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+		{Size = V(math.max(0.4, radius * 0.02), radius * 2, radius * 2), Transparency = 1}):Play()
+	Debris:AddItem(p, 1)
+end
+local function boom(pos, radius, color)
+	local p = Instance.new("Part")
+	p.Anchored, p.CanCollide, p.CanQuery, p.CanTouch = true, false, false, false
+	p.Shape = Enum.PartType.Ball
+	p.Material = Enum.Material.Neon
+	p.Color = color or Color3.fromRGB(255, 170, 60)
+	p.Transparency = 0.15
+	p.Size = V(radius * 0.3, radius * 0.3, radius * 0.3)
+	p.Position = pos
+	p.Parent = workspace
+	TweenService:Create(p, TweenInfo.new(0.5, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+		{Size = V(radius * 2, radius * 2, radius * 2), Transparency = 1}):Play()
+	Debris:AddItem(p, 0.7)
+end
+local function dust(pos, n, size)
+	pcall(function()
+		local p = Instance.new("Part")
+		p.Anchored, p.CanCollide, p.CanQuery, p.CanTouch = true, false, false, false
+		p.Transparency, p.Size, p.Position = 1, V(1, 1, 1), pos
+		p.Parent = workspace
+		local e = Instance.new("ParticleEmitter")
+		e.Texture = "rbxasset://textures/particles/smoke_main.dds"
+		e.Color = ColorSequence.new(Color3.fromRGB(150, 140, 125))
+		e.Size = NumberSequence.new({NumberSequenceKeypoint.new(0, size * 0.4), NumberSequenceKeypoint.new(1, size)})
+		e.Transparency = NumberSequence.new({NumberSequenceKeypoint.new(0, 0.25), NumberSequenceKeypoint.new(1, 1)})
+		e.Lifetime = NumberRange.new(1.2, 2.6)
+		e.Speed = NumberRange.new(size * 1.5, size * 5)
+		e.SpreadAngle = Vector2.new(80, 180)
+		e.Rate = 0
+		e.Parent = p
+		e:Emit(n)
+		Debris:AddItem(p, 3.5)
+	end)
+end
+local function spawnDebris(pos, n, power, unit)
+	for _ = 1, n do
+		local p = Instance.new("Part")
+		p.Anchored, p.CanCollide, p.CanQuery, p.CanTouch = true, false, false, false
+		local s = unit * (0.3 + math.random() * 0.9)
+		p.Size = V(s, s * (0.6 + math.random()), s)
+		p.Material, p.Color = Enum.Material.Slate, Color3.fromRGB(95, 90, 84)
+		p.CFrame = CFrame.new(pos + V(0, 0.5, 0)) * CFrame.Angles(math.random() * 6, math.random() * 6, math.random() * 6)
+		p.Parent = workspace
+		local a = math.random() * TAU
+		debrisList[#debrisList + 1] = {p = p, v = V(math.cos(a), 0, math.sin(a)) * power * (0.3 + math.random()) + V(0, power * (0.5 + math.random()), 0),
+			av = V(math.random() - 0.5, math.random() - 0.5, math.random() - 0.5) * 8, life = 2.4, gy = pos.Y}
+	end
+end
+local function updateDebris(dt)
+	for i = #debrisList, 1, -1 do
+		local d = debrisList[i]
+		d.life -= dt
+		if d.life <= 0 or not d.p.Parent then
+			if d.p then d.p:Destroy() end
+			table.remove(debrisList, i)
+		else
+			d.v += V(0, -workspace.Gravity * 0.7 * dt, 0)
+			local cf = d.p.CFrame
+			local np = cf.Position + d.v * dt
+			if np.Y < d.gy then np = V(np.X, d.gy, np.Z); d.v = V(d.v.X * 0.6, math.abs(d.v.Y) * 0.25, d.v.Z * 0.6) end
+			d.p.CFrame = CFrame.new(np) * cf.Rotation * CFrame.Angles(d.av.X * dt, d.av.Y * dt, d.av.Z * dt)
+		end
+	end
+end
+
+-- poses ---------------------------------------------------------------------------------------------
+local POSEKEYS = {"arm", "spread", "lean", "head", "crouch", "twist", "pArm", "pElbow", "pArmL", "pElbowL", "side", "stance", "land", "dive",
+	"swPitch", "swYaw", "swRoll", "headYaw"}
+local pose, poseT = {}, {}
+for _, k in ipairs(POSEKEYS) do pose[k] = 0; poseT[k] = 0 end
+local poseRate = 8
+local function poseSet(t, rate)
+	for k in pairs(poseT) do poseT[k] = t[k] or 0 end
+	poseRate = rate or 8
+end
+local SWORD_REST = {pArm = 0.5, pElbow = 0.8, swPitch = -1.25, swRoll = 0.2, twist = -0.15, stance = 0.5, lean = 0.03}
+local function restPose(rate)
+	poseSet(equipped and SWORD_REST or {stance = 0.15}, rate)
+end
+
+-- players --------------------------------------------------------------------------------------------
+local function targetHrp(pl)
+	local c = pl and pl.Character
+	return c and c:FindFirstChild("HumanoidRootPart")
+end
+local function findPlayer(txt)
+	txt = string.lower(txt or ""):match("^%s*(.-)%s*$")
+	if txt == "" then return nil end
+	local partial
+	for _, pl in ipairs(Players:GetPlayers()) do
+		if pl ~= lp then
+			local n, d = pl.Name:lower(), pl.DisplayName:lower()
+			if n == txt or d == txt then return pl end
+			if not partial and (n:sub(1, #txt) == txt or d:sub(1, #txt) == txt) then partial = pl end
+		end
+	end
+	return partial
+end
+local function getMove()
+	local mv
+	if controls then
+		local ok, v = pcall(function() return controls:GetMoveVector() end)
+		if ok then mv = v end
+	end
+	if mv then
+		local w = cam.CFrame:VectorToWorldSpace(V(mv.X, 0, mv.Z))
+		w = V(w.X, 0, w.Z)
+		if w.Magnitude > 0.01 then return w.Unit * math.min(1, mv.Magnitude) end
+		return V()
+	end
+	local d = hum.MoveDirection
+	return V(d.X, 0, d.Z)
+end
+local function groundFront(dist)
+	local F = V(-math.sin(heading), 0, -math.cos(heading))
+	return V(hp.X, gy, hp.Z) + F * dist
+end
+local function aimPoint()
+	local th = targetPl and targetHrp(targetPl)
+	if th then return th.Position + V(0, 2, 0) end
+	local p = groundFront(geo.height * 2.4)
+	return V(p.X, groundAt(V(p.X, gy + geo.height, p.Z), geo.height + 200) + 0.5, p.Z)
+end
+
+-- ammo (10 bricks) + laser --------------------------------------------------------------------------------
+local function bez3(p0, p1, p2, p3, u)
+	local v = 1 - u
+	return p0 * (v * v * v) + p1 * (3 * v * v * u) + p2 * (3 * v * u * u) + p3 * (u * u * u)
+end
+local function dirCF(dir)
+	local up = (math.abs(dir.Y) > 0.98) and V(0, 0, 1) or V(0, 1, 0)
+	return CFrame.lookAt(V(), dir, up) * CFrame.Angles(-math.pi / 2, 0, 0)
+end
+local function initAmmo()
+	A = {}
+	for i = 1, 10 do A[i] = {mode = "rack", t = 0} end
+end
+local function ammoReady()
+	local n = 0
+	for i = 1, 10 do if A[i] and A[i].mode == "rack" then n += 1 end end
+	return n
+end
+local function reloadAmmo()
+	local n = 0
+	for i = 1, 10 do
+		local st = A[i]
+		if st and st.mode == "spent" then
+			st.mode, st.t, st.dur, st.p0 = "ret", -(n * 0.09), 0.9, st.cf.Position
+			n += 1
+		end
+	end
+	if n == 0 then notify("Ammo full", 2) else notify("Reloading...", 2) end
+end
+local function fireShot()
+	if not alive or cutActive or busy then return end
+	if os.clock() < shotCd then return end
+	if laser then return end
+	local idx
+	for i = 1, 10 do if A[i].mode == "rack" then idx = i; break end end
+	if not idx then notify("Out of ammo - Reload [T]", 2) return end
+	shotCd = os.clock() + 0.16
+	local s = ammoSlots[idx]
+	local H = geo.height
+	local p0 = (s.rigCF or s.cf or CFrame.new(hp)).Position
+	local target = aimPoint()
+	local dist = (target - p0).Magnitude
+	local st = A[idx]
+	local side = V(math.cos(heading), 0, -math.sin(heading))
+	st.mode, st.t = "fly", 0
+	st.dur = clamp(dist / (H * 9) + 0.6, 0.8, 2.8)
+	st.p0 = p0
+	st.p1 = p0 + V(0, H * (0.8 + math.random() * 0.3), 0) + side * (math.random() - 0.5) * H * 0.6
+	st.p2 = target + V(0, H * 0.7, 0) + side * (math.random() - 0.5) * H * 0.3
+	st.p3 = target
+	recoil = 1
+	boom(p0, H * 0.06, Color3.fromRGB(255, 200, 120))
+	dust(p0, 6, H * 0.05)
+	shakeFrom(p0, 0.25, 0.2, H * 6)
+end
+
+local function launchLaserVisuals()
+	pcall(function()
+		laserOrb = Instance.new("Part")
+		laserOrb.Anchored, laserOrb.CanCollide, laserOrb.CanQuery, laserOrb.CanTouch = true, false, false, false
+		laserOrb.Shape, laserOrb.Material, laserOrb.Color = Enum.PartType.Ball, Enum.Material.Neon, Color3.fromRGB(130, 240, 255)
+		laserOrb.Transparency = 0.2
+		laserOrb.Size = V(1, 1, 1)
+		laserOrb.Parent = workspace
+		laserBeam = Instance.new("Part")
+		laserBeam.Anchored, laserBeam.CanCollide, laserBeam.CanQuery, laserBeam.CanTouch = true, false, false, false
+		laserBeam.Shape, laserBeam.Material, laserBeam.Color = Enum.PartType.Cylinder, Enum.Material.Neon, Color3.fromRGB(120, 235, 255)
+		laserBeam.Transparency = 1
+		laserBeam.Size = V(1, 1, 1)
+		laserBeam.Parent = workspace
+	end)
+end
+local function endLaser()
+	if laser then
+		for _, i in ipairs(laser.ids) do if A[i] then A[i].mode = "rack" end end
+	end
+	laser = nil
+	if laserOrb then laserOrb:Destroy(); laserOrb = nil end
+	if laserBeam then laserBeam:Destroy(); laserBeam = nil end
+end
+
+-- step helpers that read the rig (called from step) ---------------------------------------------------------
+local function updateAmmo(dt)
+	local H = geo.height
+	for i = 1, 10 do
+		local st, s = A[i], ammoSlots[i]
+		if st and s and s.rigCF then
+			if st.mode == "fly" then
+				st.t += dt
+				local u = clamp(st.t / st.dur, 0, 1)
+				local pos = bez3(st.p0, st.p1, st.p2, st.p3, u)
+				local nxt = bez3(st.p0, st.p1, st.p2, st.p3, math.min(u + 0.03, 1))
+				local d = nxt - pos
+				d = d.Magnitude > 1e-3 and d.Unit or V(0, -1, 0)
+				s.cf = CFrame.new(pos) * dirCF(d) * s.orient
+				if u >= 1 then
+					st.mode = "spent"
+					st.cf = CFrame.new(st.p3 + V(0, 0.5 * L, 0)) * CFrame.Angles((math.random() - 0.5) * 0.7, math.random() * TAU, (math.random() - 0.5) * 0.7) * s.orient
+					boom(st.p3, H * 0.22, Color3.fromRGB(255, 150, 50))
+					shockwave(st.p3, H * 0.3, Color3.fromRGB(255, 160, 70))
+					dust(st.p3, 14, H * 0.12)
+					spawnDebris(st.p3, 4, H * 0.5, H * 0.02)
+					shakeFrom(st.p3, 0.7, 0.35, H * 7)
+					reloadAuto = os.clock() + 1.2
+				end
+			elseif st.mode == "spent" then
+				s.cf = st.cf
+			elseif st.mode == "ret" then
+				st.t += dt
+				if st.t < 0 then
+					s.cf = st.cf
+				else
+					local u = clamp(st.t / st.dur, 0, 1)
+					local e = smooth(u)
+					local tgt = s.rigCF.Position
+					local pos = bez3(st.p0, st.p0 + V(0, H * 0.8, 0), tgt + V(0, H * 0.6, 0), tgt, e)
+					local nxt = bez3(st.p0, st.p0 + V(0, H * 0.8, 0), tgt + V(0, H * 0.6, 0), tgt, math.min(e + 0.03, 1))
+					local d = nxt - pos
+					d = d.Magnitude > 1e-3 and d.Unit or V(0, 1, 0)
+					s.cf = CFrame.new(pos) * dirCF(d) * s.orient
+					if u >= 1 then st.mode = "rack"; s.cf = s.rigCF end
+				end
+			end
+		end
+	end
+	if reloadAuto > 0 and os.clock() > reloadAuto then
+		reloadAuto = 0
+		local anyFly, anyReady = false, false
+		for i = 1, 10 do
+			if A[i].mode == "fly" then anyFly = true end
+			if A[i].mode == "rack" then anyReady = true end
+		end
+		if not anyFly and not anyReady then reloadAmmo() end
+	end
+end
+
+local function updateLaser(dt, torsoW)
+	if not laser then return end
+	local H = geo.height
+	laser.t += dt
+	local t = laser.t
+	local muzzle = (torsoW * CFrame.new(geo.muzzleRel)).Position
+	local desired = (aimPoint() - muzzle)
+	desired = desired.Magnitude > 1e-3 and desired.Unit or V(0, 0, -1)
+	laser.dir = laser.dir and laser.dir:Lerp(desired, clamp(dt * 2.5, 0, 1)) or desired
+	if laser.dir.Magnitude < 1e-3 then laser.dir = desired end
+	local dir = laser.dir.Unit
+	local n = #laser.ids
+	local up0 = (math.abs(dir.Y) > 0.98) and V(1, 0, 0) or V(0, 1, 0)
+	local right = dir:Cross(up0).Unit
+	local up = right:Cross(dir).Unit
+	local Lbeam = H * 3.2
+	local T1, T2, T3 = 1.1, 2.6, 0.8
+	laser.spin += dt * ((t < T1) and (4 + 26 * (t / T1)) or 16)
+	for j, i in ipairs(laser.ids) do
+		local s = ammoSlots[i]
+		local rigPos = s.rigCF.Position
+		local pos, cf
+		if t < T1 then
+			local e = smooth(t / 0.55)
+			local ang = (j / n) * TAU + laser.spin
+			local R = H * 0.1 * (1 - 0.35 * (t / T1))
+			local ringPos = muzzle + dir * (H * 0.12) + (right * math.cos(ang) + up * math.sin(ang)) * R
+			pos = rigPos:Lerp(ringPos, e) + V(0, math.sin(e * math.pi) * H * 0.25, 0)
+			cf = CFrame.new(pos) * dirCF(dir) * CFrame.Angles(0, ang, 0)
+		elseif t < T1 + T2 then
+			local t1 = t - T1
+			local frac = (((j - 1) / n) + t1 * 1.4) % 1
+			pos = muzzle + dir * (H * 0.1 + frac * Lbeam)
+			cf = CFrame.new(pos) * dirCF(dir) * CFrame.Angles(0, laser.spin + j, 0)
+		else
+			local u = clamp((t - T1 - T2) / T3, 0, 1)
+			local e = smooth(u - (j - 1) / n * 0.25)
+			local frac = (((j - 1) / n) + T2 * 1.4) % 1
+			local from = muzzle + dir * (H * 0.1 + frac * Lbeam)
+			pos = from:Lerp(rigPos, e) + V(0, math.sin(e * math.pi) * H * 0.3, 0)
+			cf = CFrame.new(pos) * dirCF((rigPos - from).Magnitude > 1 and (rigPos - from).Unit or dir) * CFrame.Angles(0, laser.spin, 0)
+		end
+		s.cf = cf * s.orient
+	end
+	-- local visuals
+	if laserOrb then
+		local r = (t < T1) and mix(0.5, H * 0.14, smooth(t / T1)) or ((t < T1 + T2) and H * 0.16 or mix(H * 0.16, 0.5, smooth((t - T1 - T2) / T3)))
+		laserOrb.Size = V(r, r, r)
+		laserOrb.Position = muzzle + dir * (H * 0.1)
+	end
+	if laserBeam then
+		if t >= T1 and t < T1 + T2 then
+			local endP = muzzle + dir * Lbeam
+			local mid = (muzzle + endP) / 2
+			laserBeam.Size = V(Lbeam, H * 0.035 * (0.8 + 0.4 * math.random()), H * 0.035)
+			laserBeam.CFrame = CFrame.lookAt(mid, endP) * CFrame.Angles(0, math.pi / 2, 0)
+			laserBeam.Transparency = 0.45 + 0.2 * math.random()
+		else
+			laserBeam.Transparency = 1
+		end
+	end
+	if t >= T1 and not laser.fired then
+		laser.fired = true
+		boom(muzzle + dir * (H * 0.12), H * 0.3, Color3.fromRGB(150, 240, 255))
+		shockwave(V(hp.X, gy, hp.Z), H * 1.2, Color3.fromRGB(120, 235, 255))
+		shakeFrom(muzzle, 1.4, 2.4, H * 9)
+		recoil = 1.6
+	end
+	if t >= T1 + T2 + T3 then endLaser() end
+end
+
+-- sword trail (local) --------------------------------------------------------------------------------------
+local function makeTrail()
+	pcall(function()
+		trailPart = Instance.new("Part")
+		trailPart.Anchored, trailPart.CanCollide, trailPart.CanQuery, trailPart.CanTouch = true, false, false, false
+		trailPart.Transparency, trailPart.Size = 1, V(0.2, 10, 0.2)
+		trailPart.Parent = workspace
+		local a0, a1 = Instance.new("Attachment"), Instance.new("Attachment")
+		a0.Name, a1.Name = "A0", "A1"
+		a0.Parent, a1.Parent = trailPart, trailPart
+		local tr = Instance.new("Trail")
+		tr.Attachment0, tr.Attachment1 = a0, a1
+		tr.Lifetime, tr.LightEmission, tr.FaceCamera = 0.35, 1, true
+		tr.Color = ColorSequence.new(Color3.fromRGB(150, 240, 255), Color3.fromRGB(60, 120, 255))
+		tr.Transparency = NumberSequence.new({NumberSequenceKeypoint.new(0, 0.1), NumberSequenceKeypoint.new(1, 1)})
+		tr.Enabled = false
+		tr.Parent = trailPart
+	end)
+end
+local function trailOn(on)
+	if trailPart then
+		local tr = trailPart:FindFirstChildOfClass("Trail")
+		if tr then tr.Enabled = on end
+	end
+end
+
+-- skills ----------------------------------------------------------------------------------------------
+local skills = {}
+
+function skills.Reload()
+	reloadAmmo()
+	poseSet({arm = 0.6, pArm = 0.9, lean = 0.1, head = -0.15, stance = 0.3}, 8)
+	task.wait(1.4)
+	restPose(5)
+end
+
+function skills.Roar()
+	local H = geo.height
+	poseSet({lean = -0.15, head = -0.2, side = 0.15, stance = 0.6, crouch = 0.35}, 6)
+	task.wait(0.55)
+	setGlow("Anger")
+	poseSet({lean = 0.4, head = 0.95, side = 1.15, pArm = 0.5, pArmL = 0.5, stance = 1.2}, 12)
+	local gp = groundFront(0)
+	shockwave(gp, H * 1.4, Color3.fromRGB(255, 140, 60))
+	task.delay(0.25, function() shockwave(gp, H * 2.2, Color3.fromRGB(255, 90, 40)) end)
+	dust(gp, 40, H * 0.4)
+	shakeFrom(headPos, 1.6, 2.4, H * 9)
+	task.wait(2.2)
+	restPose(4)
+	task.wait(0.6)
+end
+
+function skills.Punch(pl)
+	local H = geo.height
+	faceTarget = pl or targetPl
+	poseSet({pArm = -1.0, pElbow = 1.0, twist = -0.6, lean = 0.2, crouch = 0.3, stance = 0.7}, 9)
+	task.wait(0.5)
+	faceTarget = nil
+	poseSet({pArm = 1.5, pElbow = -0.1, twist = 0.7, lean = -0.5, crouch = 0.15, stance = 0.9}, 26)
+	dashT, dashSpd = 0.2, H * 0.5
+	task.wait(0.14)
+	local gp = groundFront(H * 0.4)
+	shockwave(gp, H * 0.5, Color3.fromRGB(255, 160, 70))
+	boom(gp + V(0, H * 0.1, 0), H * 0.15)
+	spawnDebris(gp, 8, H * 0.8, H * 0.03)
+	shakeFrom(gp, 0.9, 0.5, H * 7)
+	task.wait(0.25)
+	restPose(4)
+	task.wait(0.7)
+end
+
+function skills.Slam()
+	local H = geo.height
+	local gp
+	if equipped then
+		poseSet({pArm = 3.05, pElbow = 0.1, swPitch = 0, swRoll = 0, lean = 0.2, head = 0.3, stance = 0.6}, 8)
+		hopT = H * 0.18
+		task.wait(0.7)
+		poseSet({pArm = 0.7, pElbow = 0.2, swPitch = -2.7, swRoll = 0, lean = -0.75, head = -0.2, crouch = 0.45, stance = 0.9}, 28)
+		hopT = 0
+		trailOn(true)
+		task.wait(0.17)
+		trailOn(false)
+		gp = groundFront(H * 0.55)
+	else
+		poseSet({arm = 2.9, lean = 0.25, head = 0.3, crouch = 0.15, stance = 0.4}, 7)
+		hopT = H * 0.14
+		task.wait(0.65)
+		poseSet({arm = 0.2, lean = -0.8, crouch = 0.55, head = -0.25, stance = 0.9}, 26)
+		hopT = 0
+		task.wait(0.17)
+		gp = groundFront(H * 0.4)
+	end
+	shockwave(gp, H * 1.8, Color3.fromRGB(255, 140, 60))
+	task.delay(0.15, function() shockwave(gp, H * 2.8, Color3.fromRGB(255, 100, 40)) end)
+	boom(gp + V(0, H * 0.1, 0), H * 0.35)
+	dust(gp, 50, H * 0.35)
+	spawnDebris(gp, 22, H * 1.2, H * 0.04)
+	shakeFrom(gp, 1.8, 1.0, H * 10)
+	task.wait(0.25)
+	restPose(3)
+	task.wait(0.9)
+end
+
+function skills.Slash(pl)
+	local H = geo.height
+	faceTarget = pl or targetPl
+	poseSet({pArm = 2.2, pElbow = 0.9, twist = 0.7, swPitch = 0.3, swRoll = -0.5, lean = 0.1, crouch = 0.2, stance = 0.9}, 9)
+	task.wait(0.45)
+	faceTarget = nil
+	trailOn(true)
+	poseSet({pArm = 0.6, pElbow = 0.2, twist = -0.9, swPitch = -1.5, swRoll = 0.6, lean = -0.4, crouch = 0.2, stance = 1.0}, 26)
+	dashT, dashSpd = 0.22, H * 0.55
+	task.wait(0.16)
+	local gp = groundFront(H * 0.5)
+	shockwave(gp, H * 0.9, Color3.fromRGB(120, 235, 255))
+	boom(gp + V(0, H * 0.25, 0), H * 0.18, Color3.fromRGB(150, 240, 255))
+	shakeFrom(gp, 0.9, 0.4, H * 8)
+	task.wait(0.14)
+	poseSet({pArm = 1.4, pElbow = 0.6, twist = -0.2, swPitch = -1.0, swRoll = -1.1, swYaw = 0.5, lean = -0.1, crouch = 0.15}, 18)
+	task.wait(0.12)
+	poseSet({pArm = 1.0, pElbow = 0.3, twist = 1.0, swPitch = -1.5, swRoll = 0.8, swYaw = -0.6, lean = -0.45, stance = 1.0}, 28)
+	dashT, dashSpd = 0.18, H * 0.45
+	task.wait(0.15)
+	local gp2 = groundFront(H * 0.5)
+	shockwave(gp2, H * 1.0, Color3.fromRGB(120, 235, 255))
+	spawnDebris(gp2, 10, H * 0.7, H * 0.03)
+	shakeFrom(gp2, 1.0, 0.45, H * 8)
+	trailOn(false)
+	task.wait(0.25)
+	restPose(4)
+	task.wait(0.6)
+end
+
+function skills.Spin()
+	local H = geo.height
+	poseSet({pArm = 1.55, pElbow = 0.1, swPitch = -1.5708, swRoll = 0, side = 0.2, pArmL = 1.3, lean = 0.1, crouch = 0.25, stance = 1.0}, 10)
+	task.wait(0.4)
+	trailOn(true)
+	local T = 1.7
+	local t0 = os.clock()
+	local prev = 0
+	while alive do
+		RunService.Heartbeat:Wait()
+		local t = os.clock() - t0
+		if t >= T then break end
+		local cur = smooth(t / T)
+		heading += (cur - prev) * 4 * math.pi
+		prev = cur
+		hopT = math.sin(math.pi * clamp(t / T, 0, 1)) * H * 0.12
+		if math.random() < 0.12 then dust(groundFront(0), 3, H * 0.1) end
+	end
+	hopT = 0
+	local gp = groundFront(0)
+	shockwave(gp, H * 1.6, Color3.fromRGB(120, 235, 255))
+	spawnDebris(gp, 16, H * 1.0, H * 0.035)
+	shakeFrom(gp, 1.3, 0.8, H * 9)
+	trailOn(false)
+	task.wait(0.2)
+	restPose(4)
+	task.wait(0.6)
+end
+
+function skills.Pose()
+	local H = geo.height
+	poseSet({pArm = 1.4, pElbow = 0.3, swPitch = -0.6, swRoll = -0.8, twist = -0.5, stance = 1.0}, 10)
+	task.wait(0.35)
+	trailOn(true)
+	poseSet({pArm = 3.05, pElbow = 0.05, swPitch = 0, swRoll = 0, pArmL = -0.1, pElbowL = 1.4, side = 0.15, stance = 1.1, head = 0.22, lean = 0.2}, 12)
+	task.wait(0.25)
+	trailOn(false)
+	local gp = groundFront(0)
+	shockwave(gp, H * 1.3, Color3.fromRGB(120, 235, 255))
+	task.delay(0.2, function() shockwave(gp, H * 2.0, Color3.fromRGB(255, 220, 120)) end)
+	setBlade(true)
+	shakeFrom(headPos, 0.8, 1.2, H * 8)
+	task.wait(2.2)
+	restPose(4)
+	task.wait(0.5)
+end
+
+function skills.Laser()
+	local ids = {}
+	for i = 1, 10 do if A[i].mode == "rack" then ids[#ids + 1] = i end end
+	if #ids < 4 then notify("Laser needs 4+ ready bricks - Reload [T]", 3) return end
+	for _, i in ipairs(ids) do A[i].mode = "beam" end
+	laser = {t = 0, ids = ids, spin = 0, fired = false}
+	launchLaserVisuals()
+	setGlow("Anger")
+	poseSet({stance = 1.0, lean = 0.08, head = -0.1, arm = 0.2, side = 0.25, crouch = 0.2}, 6)
+	task.wait(1.1)
+	poseSet({stance = 1.2, lean = 0.25, crouch = 0.3, head = 0.1, side = 0.3, arm = -0.1}, 20)
+	task.wait(2.6)
+	restPose(5)
+	task.wait(0.95)
+	endLaser()
+end
+
+function skills.Equip()
+	local H = geo.height
+	if not equipped then
+		poseSet({pArm = -0.9, twist = 0.4, lean = 0.05, pElbow = 0.3, stance = 0.6}, 8)
+		task.wait(0.35)
+		swordTarget = 1
+		task.wait(0.4)
+		trailOn(true)
+		poseSet({pArm = 2.0, pElbow = 0.5, swPitch = -0.2, swRoll = -0.4, twist = -0.3, stance = 0.9}, 10)
+		task.wait(0.35)
+		poseSet({pArm = 0.9, pElbow = 0.6, swPitch = -1.4, swRoll = 0.5, twist = 0.2, stance = 0.9}, 12)
+		setBlade(true)
+		boom(handPos, H * 0.12, Color3.fromRGB(150, 240, 255))
+		task.wait(0.3)
+		trailOn(false)
+		equipped = true
+		notify("Sword equipped", 2)
+	else
+		poseSet({pArm = 1.2, swPitch = -0.3, swRoll = -0.3, twist = -0.3}, 10)
+		task.wait(0.4)
+		setBlade(false)
+		swordTarget = 0
+		task.wait(0.6)
+		equipped = false
+		notify("Sword stowed", 2)
+	end
+	restPose(5)
+	task.wait(0.4)
+end
+
+local SLOTS = {Q = {"Shot", "Spin"}, F = {"Punch", "Slash"}, R = {"Roar", "Pose"}, G = {"Slam", "Slam"}}
+local function runSkill(name, pl)
+	if not alive then notify("Spawn first", 2) return end
+	if cutActive or busy then return end
+	if name == "Shot" then fireShot() return end
+	if name == "Reload" and not act then reloadAmmo() return end
+	if act then notify("Busy: " .. act, 2) return end
+	if (name == "Laser") and laser then return end
+	act = name
+	local ok, err = pcall(skills[name], pl)
+	if not ok then warn("[Mech] " .. tostring(err)) end
+	hopT = 0
+	trailOn(false)
+	restPose(4)
+	setGlow(baseGlow())
+	faceTarget = nil
+	act = nil
+	punchCd = 0.6
+end
+local function useSlot(key)
+	local pair = SLOTS[key]
+	if pair then runSkill(pair[equipped and 2 or 1], targetPl) end
+end
+
+-- cutscene GUI + effects -------------------------------------------------------------------------------
+local guiParent
+do
+	local ok, g = pcall(function() return (gethui and gethui()) end)
+	guiParent = (ok and g) or lp:WaitForChild("PlayerGui")
+end
+local function mk(class, props, parent)
+	local o = Instance.new(class)
+	for k, v in pairs(props) do o[k] = v end
+	o.Parent = parent
+	return o
+end
+local function round(o, r) mk("UICorner", {CornerRadius = UDim.new(0, r or 8)}, o) end
+local function tween(o, props, secs, style)
+	TweenService:Create(o, TweenInfo.new(secs, style or Enum.EasingStyle.Quad, Enum.EasingDirection.Out), props):Play()
+end
+
+local cine = mk("ScreenGui", {Name = "MechCine", ResetOnSpawn = false, IgnoreGuiInset = true, DisplayOrder = 60}, guiParent)
+local barTop = mk("Frame", {Size = UDim2.new(1, 0, 0, 0), BackgroundColor3 = Color3.new(0, 0, 0), BorderSizePixel = 0, Visible = false, ZIndex = 10}, cine)
+local barBot = mk("Frame", {Size = UDim2.new(1, 0, 0, 0), AnchorPoint = Vector2.new(0, 1), Position = UDim2.new(0, 0, 1, 0),
+	BackgroundColor3 = Color3.new(0, 0, 0), BorderSizePixel = 0, Visible = false, ZIndex = 10}, cine)
+local fadeF = mk("Frame", {Size = UDim2.fromScale(1, 1), BackgroundColor3 = Color3.new(0, 0, 0), BackgroundTransparency = 1, BorderSizePixel = 0, ZIndex = 30}, cine)
+local flashF = mk("Frame", {Size = UDim2.fromScale(1, 1), BackgroundColor3 = Color3.new(1, 1, 1), BackgroundTransparency = 1, BorderSizePixel = 0, ZIndex = 31}, cine)
+local function titleLabel(color, z)
+	return mk("TextLabel", {Size = UDim2.new(1, 0, 0, 100), AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 0, 0.64, 0), BackgroundTransparency = 1,
+		Text = "", TextColor3 = color, Font = Enum.Font.GothamBlack, TextSize = 72, TextTransparency = 1, Visible = false, ZIndex = z}, cine)
+end
+local titleR = titleLabel(Color3.fromRGB(255, 40, 40), 12)
+local titleC = titleLabel(Color3.fromRGB(40, 220, 255), 12)
+local titleMain = titleLabel(Color3.fromRGB(235, 245, 255), 14)
+local subLbl = mk("TextLabel", {Size = UDim2.new(1, 0, 0, 24), Position = UDim2.new(0, 0, 0.64, 62), BackgroundTransparency = 1, Text = "GIANT MECH  //  UNIT-01",
+	TextColor3 = Color3.fromRGB(150, 225, 255), Font = Enum.Font.GothamMedium, TextSize = 16, TextTransparency = 1, Visible = false, ZIndex = 14}, cine)
+local hudLbl = mk("TextLabel", {Size = UDim2.new(0, 330, 0, 110), Position = UDim2.new(0, 28, 0.74, 0), BackgroundTransparency = 1, Text = "",
+	TextColor3 = Color3.fromRGB(120, 235, 255), Font = Enum.Font.Code, TextSize = 14, TextXAlignment = Enum.TextXAlignment.Left,
+	TextYAlignment = Enum.TextYAlignment.Top, Visible = false, ZIndex = 15}, cine)
+local skipBtn = mk("TextButton", {Size = UDim2.fromOffset(92, 30), AnchorPoint = Vector2.new(1, 1), Position = UDim2.new(1, -16, 1, -16),
+	BackgroundColor3 = Color3.new(0, 0, 0), BackgroundTransparency = 0.35, Text = "Skip >>", TextColor3 = Color3.new(1, 1, 1),
+	Font = Enum.Font.GothamMedium, TextSize = 12, Visible = false, ZIndex = 40}, cine)
+round(skipBtn, 8)
+skipBtn.Activated:Connect(function() skipFlag = true end)
+
+local function setTitleVisible(v)
+	titleR.Visible, titleC.Visible, titleMain.Visible, subLbl.Visible = v, v, v, v
+	if not v then
+		titleR.TextTransparency, titleC.TextTransparency, titleMain.TextTransparency, subLbl.TextTransparency = 1, 1, 1, 1
+	end
+end
+local function flash(a, secs)
+	flashF.BackgroundTransparency = 1 - a
+	tween(flashF, {BackgroundTransparency = 1}, secs)
+end
+local fxCC, fxBlur
+local function fxOn()
+	pcall(function()
+		fxCC = Instance.new("ColorCorrectionEffect")
+		fxCC.Saturation, fxCC.Contrast, fxCC.Brightness = -0.35, 0.25, -0.05
+		fxCC.TintColor = Color3.fromRGB(215, 230, 255)
+		fxCC.Parent = Lighting
+		fxBlur = Instance.new("BlurEffect")
+		fxBlur.Size = 0
+		fxBlur.Parent = Lighting
+	end)
+end
+local function fxOff()
+	pcall(function() if fxCC then fxCC:Destroy() end end)
+	pcall(function() if fxBlur then fxBlur:Destroy() end end)
+	fxCC, fxBlur = nil, nil
+end
+
+local winRef, openRef
+local winWas = true
+local function cineShow()
+	winWas = winRef and winRef.Visible or false
+	if winRef then winRef.Visible = false end
+	if openRef then openRef.Visible = false end
+	barTop.Visible, barBot.Visible, skipBtn.Visible = true, true, true
+	local ti = TweenInfo.new(0.9, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+	TweenService:Create(barTop, ti, {Size = UDim2.new(1, 0, 0.12, 0)}):Play()
+	TweenService:Create(barBot, ti, {Size = UDim2.new(1, 0, 0.12, 0)}):Play()
+end
+local function cineHide()
+	setTitleVisible(false)
+	hudLbl.Visible = false
+	skipBtn.Visible = false
+	fxOff()
+	local ti = TweenInfo.new(0.6, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+	TweenService:Create(barTop, ti, {Size = UDim2.new(1, 0, 0, 0)}):Play()
+	TweenService:Create(barBot, ti, {Size = UDim2.new(1, 0, 0, 0)}):Play()
+	if winRef then winRef.Visible = winWas end
+	if openRef then openRef.Visible = true end
+	task.delay(0.7, function()
+		if not cutActive then barTop.Visible, barBot.Visible = false, false end
+	end)
+end
+
+-- flame / thruster (local) for the fall
+local function makeFlame()
+	pcall(function()
+		flamePart = Instance.new("Part")
+		flamePart.Anchored, flamePart.CanCollide, flamePart.CanQuery, flamePart.CanTouch = true, false, false, false
+		flamePart.Transparency, flamePart.Size = 1, V(1, 1, 1)
+		flamePart.Parent = workspace
+		local e = Instance.new("ParticleEmitter")
+		e.Name = "Fire"
+		e.LightEmission = 1
+		e.Color = ColorSequence.new({ColorSequenceKeypoint.new(0, Color3.fromRGB(255, 240, 160)), ColorSequenceKeypoint.new(0.4, Color3.fromRGB(255, 120, 30)),
+			ColorSequenceKeypoint.new(1, Color3.fromRGB(60, 40, 40))})
+		local h = geo.height
+		e.Size = NumberSequence.new({NumberSequenceKeypoint.new(0, h * 0.28), NumberSequenceKeypoint.new(1, 0)})
+		e.Transparency = NumberSequence.new({NumberSequenceKeypoint.new(0, 0), NumberSequenceKeypoint.new(1, 1)})
+		e.Lifetime = NumberRange.new(0.7, 1.4)
+		e.Speed = NumberRange.new(h * 0.1, h * 0.6)
+		e.SpreadAngle = Vector2.new(25, 25)
+		e.Rate = 0
+		e.Parent = flamePart
+	end)
+end
+local function flameRate(r)
+	if flamePart then
+		local e = flamePart:FindFirstChild("Fire")
+		if e then e.Rate = r end
+	end
+end
+
+local TITLE = "TITAN"
+local GLITCH = "#%&@$X0?/\\|"
+local function scramble(p)
+	local s = ""
+	for i = 1, #TITLE do
+		if i / #TITLE <= p then
+			s ..= TITLE:sub(i, i)
+		else
+			local r = math.random(#GLITCH)
+			s ..= GLITCH:sub(r, r)
+		end
+	end
+	return s
+end
+local HUD_TEXT = "> TITAN UNIT-01\n> REACTOR ........ 100%\n> ACTUATORS ..... OK\n> WEAPONS ....... ARMED\n> PILOT ......... LINKED"
+
+-- THE CUTSCENE: orbital drop -> brace -> crash landing -> hero rise -> hero pose -> visor ignite -> roar orbit -> title
+local function runIntro()
+	cutActive, skipFlag, busy = true, false, true
+	setGlow("Offline")
+	for k in pairs(poseT) do poseT[k] = 0 end
+	poseSet({dive = 1, stance = 0.2}, 6)
+	cam.CameraType = Enum.CameraType.Scriptable
+	cineShow()
+	fxOn()
+	local H = geo.height
+	local A0 = clamp(H * 13, 150, 1400)
+	fall.y, fall.vy, fall.active, fall.landed, fall.phase = A0, 0, false, false, 1
+	fall.hb = math.min(H * 1.6, A0 * 0.3)
+	fall.g = 2 * (A0 - fall.hb) / (2.8 * 2.8)
+	fall.v1 = fall.g * 2.8
+	makeFlame()
+	fadeF.BackgroundTransparency = 0
+	tween(fadeF, {BackgroundTransparency = 1}, 1.2)
+	task.spawn(function()
+		local END_L = 9.9
+		local t0, last, t = os.clock(), os.clock(), 0
+		local tl, tt = nil, 0
+		local fired = {}
+		local camShk, fovKick, blurV, redT = 0, 0, 0, 0
+		local titleT0
+		local function cue(tm, key, fn) if t >= tm and not fired[key] then fired[key] = true; fn() end end
+		local function cueL(tm, key, fn) if tl and tt >= tm and not fired[key] then fired[key] = true; fn() end end
+		local function endAll() return skipFlag or (tl and tt >= END_L) or t > 30 end
+		while alive do
+			RunService.RenderStepped:Wait()
+			local now = os.clock()
+			local dt = math.min(now - last, 0.05)
+			last = now
+			t = now - t0
+			if fall.landed and not tl then tl = t end
+			tt = tl and (t - tl) or 0
+			if endAll() then break end
+			local rc = CFrame.new(hp.X, gy, hp.Z) * CFrame.Angles(0, heading, 0)
+			local function P(x, y, z) return rc:PointToWorldSpace(V(x * H, y * H, z * H)) end
+			local function R(x, y, z) return rc:VectorToWorldSpace(V(x * H, y * H, z * H)) end
+			local ground = V(hp.X, gy, hp.Z)
+
+			-- flame follows the feet
+			if flamePart then
+				flamePart.Position = footPos + V(0, -H * 0.05, 0)
+			end
+
+			-- cues: before landing (absolute time) -----------------------------------------------------
+			cue(0.2, "rumble", function() camShk = 0.6 end)
+			cue(1.2, "go", function() fall.active = true; flameRate(260); flash(0.25, 0.5) end)
+			if fall.phase == 2 then
+				cue(0, "brake", function()
+					flash(0.5, 0.4); blurV = 20; fovKick = 10; camShk = 1.6; flameRate(520)
+					poseSet({dive = 0, land = 0.5, stance = 0.4}, 3)
+				end)
+			end
+			if t > 7.5 and not fall.landed then fall.y = 0 end
+			if fall.landed then
+				cue(0, "touch", function()
+					flameRate(0)
+					poseSet({land = 1}, 40)
+					flash(0.95, 0.7); camShk = 4; fovKick = -20; blurV = 12; redT = 1
+					shockwave(ground, H * 2.2, Color3.fromRGB(255, 190, 90))
+					task.delay(0.12, function() shockwave(ground, H * 3.4, Color3.fromRGB(255, 130, 50)) end)
+					task.delay(0.28, function() shockwave(ground, H * 4.6, Color3.fromRGB(255, 90, 40)) end)
+					boom(ground + V(0, H * 0.1, 0), H * 0.9)
+					dust(ground, 90, H * 0.8)
+					spawnDebris(ground, 40, H * 2.2, H * 0.06)
+				end)
+			end
+			-- cues: after landing (time since touchdown) --------------------------------------------------
+			cueL(1.1, "rise1", function() poseSet({land = 0.5, head = 0.15, stance = 0.6}, 2.2) end)
+			cueL(2.0, "rise2", function() poseSet({land = 0, side = 0.1, head = 0.1, stance = 0.8, lean = 0.1}, 2.4) end)
+			cueL(2.8, "hero", function()
+				poseSet({pArm = 3.05, pElbow = 0.05, pArmL = -0.1, pElbowL = 1.4, side = 0.15, stance = 1.1, head = 0.22, lean = 0.2}, 3.2)
+				hudLbl.Visible = true
+				camShk = 0.6
+			end)
+			cueL(4.7, "eyes", function() setGlow("Online"); flash(0.6, 0.5); camShk = 1.4; fovKick = -8 end)
+			cueL(4.85, "eoff", function() setGlow("Offline") end)
+			cueL(4.92, "eon", function() setGlow("Online") end)
+			cueL(6.0, "roar", function()
+				poseSet({side = 1.1, pArm = 0.6, pArmL = 0.6, lean = 0.35, head = 0.9, stance = 1.2}, 9)
+				setGlow("Anger"); redT = 1.4; camShk = 2.6; blurV = 14
+				shockwave(ground, H * 1.8, Color3.fromRGB(120, 235, 255))
+				task.delay(0.2, function() shockwave(ground, H * 3.0, Color3.fromRGB(255, 80, 60)) end)
+				dust(ground, 40, H * 0.5)
+			end)
+			cueL(7.3, "calm", function() poseSet({side = 0.5, stance = 1.0, lean = 0.2, head = 0.2, pArm = 0.2}, 4) end)
+			cueL(7.6, "title", function() titleT0 = tt; setTitleVisible(true); flash(0.55, 0.3); camShk = 1.4 end)
+			cueL(9.4, "out", function() tween(fadeF, {BackgroundTransparency = 0}, 0.4) end)
+
+			-- camera ----------------------------------------------------------------------------------------
+			local pos, target, fov, roll
+			if not tl then
+				if t < 2.2 then
+					local k = smooth(t / 2.2)
+					pos = P(0.1, 0.03, -0.9)
+					target = torsoPos
+					fov, roll = mix(60, 42, k), 0.08
+				elseif fall.phase == 1 then
+					pos = torsoPos + R(-1.4, 0.15, -1.6)
+					target = torsoPos
+					fov, roll = 74, -0.1
+				else
+					local mid = V(hp.X, gy + math.max(fall.y * 0.55, H * 0.25), hp.Z)
+					pos = P(-0.55, 0.05, -1.0)
+					target = mid
+					fov, roll = 62, 0.04
+				end
+			elseif tt < 1.2 then
+				local k = tt / 1.2
+				pos = P(mix(-1.15, -1.0, k), 0.08, -0.25)
+				target = P(0, 0.17, -0.1)
+				fov, roll = mix(46, 38, k), -0.06
+			elseif tt < 2.8 then
+				local k = smooth((tt - 1.2) / 1.6)
+				local a = mix(-1.3, -0.15, k)
+				local r, h = mix(1.2, 0.95, k), mix(0.1, 0.24, k)
+				pos = P(math.sin(a) * r, h, -math.cos(a) * r)
+				target = headPos:Lerp(torsoPos, 0.3)
+				fov, roll = mix(58, 52, k), mix(-0.1, 0, k)
+			elseif tt < 4.5 then
+				local k = smooth((tt - 2.8) / 1.7)
+				pos = P(mix(0.6, 0.15, k), mix(0.04, 0.25, k), -mix(0.75, 1.5, k))
+				target = torsoPos + V(0, H * 0.08, 0)
+				fov, roll = mix(62, 52, k), mix(0.06, 0, k)
+			elseif tt < 6.0 then
+				local k = smooth((tt - 4.5) / 1.5)
+				pos = headPos + R(mix(0.14, -0.03, k), 0.01, -mix(0.5, 0.2, k))
+				target = headPos
+				fov, roll = mix(34, 20, k), 0
+			elseif tt < 7.6 then
+				local k = smooth((tt - 6.0) / 1.6)
+				local a = mix(-1.1, 1.0, k)
+				local r, h = 1.35, mix(0.1, 0.5, k)
+				pos = P(math.sin(a) * r, h, -math.cos(a) * r)
+				target = torsoPos
+				fov, roll = 60, math.sin(k * math.pi) * 0.06
+			else
+				local k = smooth((tt - 7.6) / 2.3)
+				pos = P(0, 0.06, -mix(1.4, 1.0, k))
+				target = headPos
+				fov, roll = mix(52, 44, k), 0
+			end
+			if camShk > 0.01 then
+				pos += V(math.random() - 0.5, math.random() - 0.5, math.random() - 0.5) * camShk * 0.012 * H
+				camShk *= 0.9 ^ (dt * 60)
+			end
+			fovKick *= 0.9 ^ (dt * 60)
+			if pos.Y < gy + 0.5 then pos = V(pos.X, gy + 0.5, pos.Z) end
+			cam.CFrame = CFrame.lookAt(pos, target) * CFrame.Angles(0, 0, roll)
+			cam.FieldOfView = clamp(fov + fovKick, 8, 110)
+
+			-- grade, blur, HUD, title ----------------------------------------------------------------------
+			redT = math.max(0, redT - dt * 0.4)
+			if fxCC then
+				local k = clamp(redT, 0, 1)
+				fxCC.TintColor = fxCC.TintColor:Lerp(Color3.new(1, 1 - 0.3 * k, 1 - 0.3 * k), clamp(dt * 3, 0, 1))
+				fxCC.Saturation = mix(-0.35, -0.1, k)
+			end
+			if fxBlur then
+				fxBlur.Size = blurV
+				blurV *= 0.88 ^ (dt * 60)
+			end
+			if hudLbl.Visible and tl then
+				local n = math.floor((tt - 2.8) * 38)
+				hudLbl.Text = HUD_TEXT:sub(1, clamp(n, 0, #HUD_TEXT))
+				if tt > 7.4 then hudLbl.Visible = false end
+			end
+			if titleT0 then
+				local p = tt - titleT0
+				local solved = clamp(p / 0.7, 0, 1)
+				local txt = (solved >= 1) and TITLE or scramble(solved)
+				if solved >= 1 and math.random() < 0.06 then txt = scramble(0.6) end
+				for _, l in ipairs({titleMain, titleR, titleC}) do l.Text = txt end
+				titleMain.TextSize = mix(120, 72, smooth(p / 0.25))
+				titleR.TextSize, titleC.TextSize = titleMain.TextSize, titleMain.TextSize
+				local amp = ((p < 0.7) or math.random() < 0.05) and 10 or 2
+				titleR.Position = UDim2.new(0, math.random(-amp, amp), 0.64, math.random(-amp, amp))
+				titleC.Position = UDim2.new(0, math.random(-amp, amp), 0.64, math.random(-amp, amp))
+				titleMain.Position = UDim2.new(0, 0, 0.64, 0)
+				titleMain.TextTransparency = 0
+				titleR.TextTransparency, titleC.TextTransparency = 0.55, 0.55
+				subLbl.TextTransparency = clamp(1 - (p - 0.7) * 1.5, 0.15, 1)
+			end
+		end
+		-- end of cutscene
+		if flamePart then flamePart:Destroy(); flamePart = nil end
+		fall.y, fall.vy, fall.active, fall.landed = 0, 0, false, true
+		cutActive, busy = false, false
+		crouchTarget, crouchRate = 0, 4
+		restPose(5)
+		setGlow(baseGlow())
+		cam.CameraType = Enum.CameraType.Custom
+		cam.FieldOfView = baseFov
+		flashF.BackgroundTransparency = 1
+		cineHide()
+		tween(fadeF, {BackgroundTransparency = 1}, 0.5)
+	end)
+end
+
+-- dismiss / summon ----------------------------------------------------------------------------------
+local function dismiss()
+	skipFlag = true
+	cutActive, busy = false, false
+	cam.CameraType = Enum.CameraType.Custom
+	pcall(function() cam.FieldOfView = baseFov end)
+	fadeF.BackgroundTransparency, flashF.BackgroundTransparency = 1, 1
+	cineHide()
+	endLaser()
+	setRide(false)
+	for _, s in ipairs(saved) do
+		local p = s.p
+		if p and p.Parent then
+			pcall(function()
+				local bf = p:FindFirstChild("NoseyAntiG")
+				if bf then bf:Destroy() end
+				p.CFrame = s.cf
+				p.Anchored = s.anchored
+				p.CanCollide = s.collide
+				p.Color, p.Material = s.color, s.material
+				p.AssemblyLinearVelocity = V()
+			end)
+		end
+	end
+	if camPart then camPart:Destroy() end
+	if flamePart then flamePart:Destroy() end
+	if trailPart then trailPart:Destroy() end
+	for _, d in ipairs(debrisList) do if d.p then d.p:Destroy() end end
+	debrisList = {}
+	camPart, flamePart, trailPart = nil, nil, nil
+	pool, slots, saved, ammoSlots, A = {}, {}, {}, {}, {}
+	alive, control, targetPl, act, faceTarget = false, false, nil, nil, nil
+	equipped, swordEq, swordTarget = false, 0, 0
+	curSp, hop, hopT, recoil = 0, 0, 0, 0
+	fall.y, fall.active, fall.landed = 0, false, false
+	avatarCF = nil
+	cam.CameraSubject = hum
+end
+
+-- builds / refreshes the per-brick offsets from the current layout
+local function assignSlots(create)
+	local idx = 0
+	local cxs, czs, Ls = cxb * sc, czb * sc, Lb * sc
+	for _, pt in ipairs(parts) do
+		for j = 1, pt.ny do
+			for k = 1, pt.nz do
+				for i = 1, pt.nx do
+					if not (pt.tube and i > 1 and i < pt.nx and k > 1 and k < pt.nz) then
+						idx += 1
+						local off = V((i - 0.5 - pt.nx / 2) * cxs, (j - 0.5 - pt.ny / 2) * Ls, (k - 0.5 - pt.nz / 2) * czs)
+						local s
+						if create then
+							local p = pool[idx]
+							local color, gl = slotStyle(pt.kind, i, k, j, pt.nx, pt.ny)
+							s = {p = p, color = color, gl = gl, orientBase = orientFor(p), ammo = pt.ammo, sword = (pt.bone == "Sword")}
+							slots[idx] = s
+							saved[idx] = {p = p, cf = p.CFrame, anchored = p.Anchored, collide = p.CanCollide, color = p.Color, material = p.Material}
+						else
+							s = slots[idx]
+						end
+						s.bone = pt.bone
+						s.off = (pt.c + off) - bones[pt.bone].pv
+						s.orient = (pt.rot or CFrame.new()) * s.orientBase
+					end
+				end
+			end
+		end
+	end
+end
+local function rebuildGeometry()
+	L = Lb * sc
+	bones, order, parts, geo = layout(cxb * sc, czb * sc, Lb * sc, tierCur.tpl, tierCur.need - tierCur.base)
+	assignSlots(false)
+	if trailPart then
+		local a0, a1 = trailPart:FindFirstChild("A0"), trailPart:FindFirstChild("A1")
+		trailPart.Size = V(0.2, geo.bladeLen, 0.2)
+		if a0 then a0.Position = V(0, geo.bladeLen / 2, 0) end
+		if a1 then a1.Position = V(0, -geo.bladeLen / 2, 0) end
+	end
+end
+
+local sizeBox
+local function summon()
+	if alive then return end
+	local list, dims = gather()
+	if not list then notify("Cannot spawn: " .. tostring(dims), 6) return end
+	local tier = planTier(#list)
+	if not tier then
+		notify(string.format("Need at least %d bricks of one size (1x1x3), found %d (%.1fx%.1fx%.1f). Stand next to your own bricks.",
+			NEED_MIN, #list, dims[1], dims[2], dims[3]), 9)
+		return
+	end
+	tierCur, curNeed, tplCur = tier, tier.need, TEMPLATES[tier.tpl]
+	pool = {}
+	for i = 1, curNeed do pool[i] = list[i][1] end
+	cxb, czb, Lb = dims[1], dims[2], dims[3]
+	sc = clamp(scTarget, 1, 10)
+	L = Lb * sc
+	bones, order, parts, geo = layout(cxb * sc, czb * sc, Lb * sc, tier.tpl, tier.need - tier.base)
+	slots, saved, ammoSlots = {}, {}, {}
+	assignSlots(true)
+	for _, s in ipairs(slots) do
+		local p = s.p
+		pcall(function() p.Anchored = false; p.CanCollide = false; p.CanTouch = false end)
+		pcall(function()
+			local bf = Instance.new("BodyForce")
+			bf.Name = "NoseyAntiG"
+			bf.Force = V(0, p.AssemblyMass * workspace.Gravity, 0)
+			bf.Parent = p
+		end)
+		pcall(function() p.Color = s.color; p.Material = (s.gl == "blade") and Enum.Material.Metal or Enum.Material.SmoothPlastic end)
+		if s.ammo then ammoSlots[s.ammo] = s end
+	end
+	initAmmo()
+	pcall(function() lp.MaximumSimulationRadius = math.huge end)
+	pcall(function() sethiddenproperty(lp, "SimulationRadius", math.huge) end)
+
+	camPart = mk("Part", {Anchored = true, CanCollide = false, CanQuery = false, Transparency = 1, Size = V(1, 1, 1)}, workspace)
+	makeTrail()
+	rebuildGeometry()
+	refreshFilters()
+	oldZoomMax, oldZoomMin = lp.CameraMaxZoomDistance, lp.CameraMinZoomDistance
+	baseFov = cam.FieldOfView
+
+	local look = hrp.CFrame.LookVector
+	look = V(look.X, 0, look.Z)
+	look = look.Magnitude > 1e-3 and look.Unit or V(0, 0, -1)
+	heading = math.atan2(look.X, look.Z)
+	local sp0 = hrp.Position + look * (geo.height * 0.8 + 10)
+	hp = V(sp0.X, 0, sp0.Z)
+	gy = groundAt(V(sp0.X, hrp.Position.Y, sp0.Z), 40)
+	crouch, crouchTarget, crouchRate, curSp, wavePh = 0, 0, 4, 0, 0
+	control, targetPl, equipped, swordEq, swordTarget = false, nil, false, 0, 0
+	recoil, hop, hopT, laser = 0, 0, 0, nil
+	for k in pairs(pose) do pose[k] = 0; poseT[k] = 0 end
+	headPos, torsoPos = V(hp.X, gy + geo.headY, hp.Z), V(hp.X, gy + geo.torsoY, hp.Z)
+	handPos, footPos = V(hp.X, gy + geo.height * 0.2, hp.Z), V(hp.X, gy, hp.Z)
+	alive = true
+	setGlow("Offline")
+	setBlade(false)
+	runIntro()
+	notify(string.format("%d bricks (%s build) | %.0fx | height %.0f studs", curNeed, tier.tpl, sc, geo.height), 6)
+end
+
+-- main step -----------------------------------------------------------------------------------------
+local function footZ(h, k)
+	return -(geo.thighLen * math.sin(h) + geo.shinLen * math.sin(h + k))
+end
+
+local function step(dt)
+	local t = os.clock()
+	-- live resize
+	if math.abs(sc - scTarget) > 0.002 then
+		sc += (scTarget - sc) * clamp(dt * 4, 0, 1)
+		if math.abs(sc - scTarget) < 0.01 then sc = scTarget end
+		rebuildGeometry()
+	end
+	local H = geo.height
+	gy = groundAt(V(hp.X, gy, hp.Z), H + 30)
+	punchCd = math.max(0, punchCd - dt)
+
+	-- orbital drop (cutscene)
+	if fall.active and not fall.landed then
+		if fall.phase == 1 then
+			fall.vy += fall.g * dt
+			fall.y -= fall.vy * dt
+			if fall.y <= fall.hb then fall.phase = 2 end
+		else
+			local vt = (fall.y / math.max(fall.hb, 1)) * fall.v1 * 0.22 + H * 0.35
+			fall.vy += (vt - fall.vy) * clamp(dt * 6, 0, 1)
+			fall.y -= fall.vy * dt
+		end
+		if fall.y <= 0 then fall.y = 0; fall.landed = true; fall.landT = t; fall.active = false end
+	end
+
+	-- 1) movement intent
+	local wantDir, tgtSp = nil, 0
+	local spd = SPEED * sc
+	if not (busy or act or cutActive) then
+		if control then
+			local mv = getMove()
+			if mv.Magnitude > 0.1 then wantDir, tgtSp = mv.Unit, spd * math.min(1, mv.Magnitude) end
+		elseif targetPl then
+			local th = targetHrp(targetPl)
+			local tHum = th and th.Parent and th.Parent:FindFirstChildOfClass("Humanoid")
+			if not th or not targetPl.Parent then
+				targetPl = nil
+				notify("Target lost", 3)
+			elseif tHum and tHum.Health <= 0 then
+				targetPl = nil
+				notify("Target down", 3)
+			else
+				local flat = V(th.Position.X - hp.X, 0, th.Position.Z - hp.Z)
+				local dist = flat.Magnitude
+				local reach = H * 0.33
+				if dist > 1e-3 then wantDir = flat.Unit end
+				if dist > reach * 0.8 then tgtSp = spd * smooth((dist - reach * 0.8) / (H * 0.3) + 0.2) end
+				aiShotT -= dt
+				aiLaserT -= dt
+				if dist > reach * 2 and dist < H * 8 and aiShotT <= 0 then fireShot(); aiShotT = 0.9 end
+				if dist > H * 1.5 and dist < H * 6 and aiLaserT <= 0 then task.spawn(runSkill, "Laser"); aiLaserT = 14 end
+				if dist <= reach and punchCd <= 0 then
+					local pick = equipped and "Slash" or ((math.random() < 0.65) and "Punch" or "Slam")
+					task.spawn(runSkill, pick, targetPl)
+				end
+			end
+		end
+	end
+	if act and faceTarget then
+		local th = targetHrp(faceTarget)
+		if th then
+			local flat = V(th.Position.X - hp.X, 0, th.Position.Z - hp.Z)
+			if flat.Magnitude > 1e-3 then
+				heading += clamp(adiff(math.atan2(-flat.X, -flat.Z), heading) * math.min(1, dt * 6), -5 * dt, 5 * dt)
+			end
+		end
+	end
+	if wantDir then
+		local d = adiff(math.atan2(-wantDir.X, -wantDir.Z), heading)
+		heading += clamp(d * math.min(1, dt * 3), -2.2 * dt, 2.2 * dt)
+	end
+	local F = V(-math.sin(heading), 0, -math.cos(heading))
+	curSp += (tgtSp - curSp) * math.min(1, dt * ((tgtSp > curSp) and 1.6 or 4))
+	if curSp > 0.2 then hp = hp + F * curSp * dt end
+	if dashT > 0 then dashT -= dt; hp = hp + F * dashSpd * dt end
+
+	-- 2) pose blending
+	crouch += (crouchTarget - crouch) * clamp(dt * crouchRate, 0, 1)
+	local kp = clamp(dt * poseRate, 0, 1)
+	for key, v in pairs(pose) do pose[key] = v + (poseT[key] - v) * kp end
+	hop += (hopT - hop) * clamp(dt * 9, 0, 1)
+	recoil = math.max(0, recoil - dt * 3)
+	swordEq += clamp(swordTarget - swordEq, -dt * 2, dt * 2)
+	local ce = clamp(crouch + pose.crouch, 0, 1.2)
+	local landK, diveK = pose.land, pose.dive
+
+	-- 3) walk cycle (weighty mech gait, cadence tied to ground speed)
+	local sp = curSp
+	local a = clamp(sp / (50 * sc), 0, 1)
+	local walking = clamp(sp / (4 * sc), 0, 1)
+	local idle = 1 - walking
+	local legLen = geo.thighLen + geo.shinLen + geo.footH
+	local swing = (0.24 + 0.34 * a) * (1 - math.min(ce, 1) * 0.8)
+	if sp > 0.2 * sc then
+		wavePh += dt * clamp(math.pi * sp / (2 * (geo.thighLen + geo.shinLen) * math.max(swing, 0.12)), 0.4, 7)
+	end
+	local sw, cw = math.sin(wavePh), math.cos(wavePh)
+	local amp = swing * walking
+	local hip = ce * 0.9
+	local hL, hR = hip + sw * amp, hip - sw * amp
+	local bend = (0.3 + 0.8 * a) * walking
+	local kL = -ce * 1.5 - math.max(0, cw) * bend
+	local kR = -ce * 1.5 - math.max(0, -cw) * bend
+	if landK > 0.001 then
+		hL, kL = mix(hL, 1.45, landK), mix(kL, -2.4, landK)
+		hR, kR = mix(hR, 0.14, landK), mix(kR, -1.75, landK)
+	end
+
+	local armSw = sw * (0.12 + 0.4 * a) * walking
+	local breathe = math.sin(t * 1.2) * 0.015
+	local servo = math.sin(t * 7.3) * 0.004 * idle
+	local lag = a * 0.25
+	local lookYaw = math.sin(t * 0.5) * 0.28 * idle * (act and 0 or 1) * (1 - landK)
+	local stance = pose.stance
+
+	local rot = {
+		Root = CFrame.new(),
+		Torso = CFrame.Angles(-ce * 0.5 - a * 0.2 + pose.lean - landK * 0.95 - diveK * 0.1 + breathe + recoil * 0.1,
+			pose.twist - sw * 0.1 * walking, cw * 0.04 * walking),
+		Head = CFrame.Angles(ce * 0.35 + a * 0.2 + pose.head - breathe + landK * 0.85 + diveK * 0.2 - recoil * 0.08 + servo, lookYaw + pose.headYaw,
+			math.sin(t * 0.6) * 0.03),
+		ArmL = CFrame.Angles(ce * 0.3 - a * 0.12 - armSw + pose.arm + pose.pArmL - landK * 0.9 - diveK * 0.35, pose.spread, 0.05 + pose.side + diveK * 0.3),
+		ArmR = CFrame.Angles(ce * 0.3 - a * 0.12 + armSw + pose.arm + pose.pArm + landK * 1.25 - diveK * 0.35, -pose.spread, -0.05 - pose.side - diveK * 0.3),
+		ForeL = CFrame.Angles(0.12 + a * 0.25 + ce * 0.3 + pose.pElbowL + math.max(0, -armSw) * 0.7 + diveK * 0.2, 0, 0),
+		ForeR = CFrame.Angles(0.12 + a * 0.25 + ce * 0.3 + pose.pElbow + math.max(0, armSw) * 0.7 + diveK * 0.2, 0, 0),
+		HandL = CFrame.Angles(0.1 + a * 0.2 + math.sin(t * 1.5) * 0.02, 0, 0),
+		HandR = CFrame.Angles(0.1 + a * 0.2 + math.sin(t * 1.5 + 1.3) * 0.02, 0, 0),
+		ThighL = CFrame.Angles(hL, 0, -stance * 0.12 - diveK * 0.05), ThighR = CFrame.Angles(hR, 0, stance * 0.12 + diveK * 0.05),
+		ShinL = CFrame.Angles(kL, 0, 0), ShinR = CFrame.Angles(kR, 0, 0),
+		FootL = CFrame.Angles(-(hL + kL) + math.max(0, cw) * 0.25 * walking, 0, 0),
+		FootR = CFrame.Angles(-(hR + kR) + math.max(0, -cw) * 0.25 * walking, 0, 0),
+	}
+	for _, s in ipairs({-1, 1}) do
+		local d = s < 0 and "L" or "R"
+		for n = 1, tplCur.fins do
+			rot["Fin" .. d .. n] = CFrame.Angles(lag * 0.8 + math.sin(t * 2 - n) * 0.04 - pose.head * 0.2, 0, -s * (math.sin(t * 2.4 + n) * 0.05 + pose.side * 0.1))
+		end
+	end
+
+	-- keep the planted foot on the ground; feet stay under the body when crouching / landing
+	local reach = math.max(
+		geo.thighLen * math.cos(hL) + geo.shinLen * math.cos(hL + kL) + geo.footH,
+		geo.thighLen * math.cos(hR) + geo.shinLen * math.cos(hR + kR) + geo.footH)
+	local baseY = gy + (reach - legLen) + fall.y + hop
+	local fz = (footZ(hL, kL) + footZ(hR, kR)) * 0.5
+	local baseCF = CFrame.new(hp.X, baseY, hp.Z) * CFrame.Angles(0, heading, 0) * CFrame.new(0, 0, fz * clamp(ce + landK, 0, 1))
+
+	-- 4) forward kinematics
+	local M = {}
+	for _, name in ipairs(order) do
+		if name ~= "Sword" then
+			local b = bones[name]
+			local r = rot[name] or CFrame.new()
+			if b.parent then
+				M[name] = M[b.parent] * CFrame.new(b.pv - bones[b.parent].pv) * r
+			else
+				M[name] = CFrame.new(b.pv) * r
+			end
+		end
+	end
+	-- sword: stowed on the back <-> held in the right fist (orientation driven by pose.swPitch / swYaw / swRoll)
+	local torsoW = baseCF * M.Torso
+	local stowW = torsoW * geo.stowRel
+	local gripPos = (baseCF * M.HandR * CFrame.new(0, -geo.fistHalf, 0)).Position
+	local heldW = CFrame.new(gripPos) * torsoW.Rotation * CFrame.Angles(0, pose.swYaw, 0) * CFrame.Angles(pose.swPitch, 0, 0) * CFrame.Angles(0, 0, pose.swRoll)
+	local e = smooth(swordEq)
+	local swordW = stowW:Lerp(heldW, e) + V(0, math.sin(e * math.pi) * H * 0.18, 0)
+	if equipped and swordEq >= 1 then swordW = swordW * CFrame.Angles(0, 0, math.sin(t * 2) * 0.015) end
+
+	for _, s in ipairs(slots) do
+		local base = s.sword and swordW or (baseCF * M[s.bone])
+		local cf = base * CFrame.new(s.off) * s.orient
+		s.rigCF = cf
+		s.cf = cf
+	end
+	updateAmmo(dt)
+	updateLaser(dt, torsoW)
+	for _, s in ipairs(slots) do
+		local cf = s.cf
+		if s.last and dt > 0 then
+			local v = (cf.Position - s.last) / dt
+			if v.Magnitude > 250 then v = v.Unit * 250 end
+			s.vel = v
+		else
+			s.vel = V()
+		end
+		s.last = cf.Position
+	end
+
+	headPos = (baseCF * M.Head * CFrame.new(V(0, geo.headY, 0) - bones.Head.pv)).Position
+	torsoPos = (baseCF * M.Torso * CFrame.new(V(0, geo.torsoY, 0) - bones.Torso.pv)).Position
+	handPos = (baseCF * M.HandR * CFrame.new(0, -geo.fistHalf, 0)).Position
+	footPos = (baseCF * M.FootL * CFrame.new(0, -geo.footH, 0)).Position
+	if trailPart then
+		trailPart.CFrame = swordW * CFrame.new(0, geo.bladeY0 + geo.bladeLen / 2, 0)
+	end
+
+	-- footsteps: camera thud + dust on every plant
+	local cwPos = cw >= 0
+	if cwPos ~= lastCwPos then
+		lastCwPos = cwPos
+		if walking > 0.35 and not cutActive then
+			local d = cwPos and "R" or "L"
+			local fp = (baseCF * M["Foot" .. d] * CFrame.new(0, -geo.footH, 0)).Position
+			local gp = V(fp.X, gy, fp.Z)
+			shakeFrom(gp, 0.18, 0.22, H * 6)
+			shockwave(gp, H * 0.12, Color3.fromRGB(200, 190, 170))
+			if sc >= 1.5 then dust(gp, 6, H * 0.06) end
+		end
+	end
+
+	-- 5) avatar inside the body + guard (stay the closest player so the bricks stay yours)
+	avatarCF = CFrame.new(torsoPos)
+	radT += dt
+	if radT > 1 then
+		radT = 0
+		pcall(function() lp.MaximumSimulationRadius = math.huge end)
+		pcall(function() sethiddenproperty(lp, "SimulationRadius", math.huge) end)
+	end
+	guardT += dt
+	if guardT > 0.1 then
+		guardT = 0
+		threats = {}
+		local near = 120 + 4 * L
+		for _, pl in ipairs(Players:GetPlayers()) do
+			if pl ~= lp then
+				local th = targetHrp(pl)
+				if th and (th.Position - torsoPos).Magnitude < near + H then
+					local bp, bd
+					for _, s in ipairs(slots) do
+						local d = (s.cf.Position - th.Position).Magnitude
+						if not bd or d < bd then bd, bp = d, s.cf.Position end
+					end
+					if bd and bd < near then threats[#threats + 1] = {pos = bp, d = bd} end
+				end
+			end
+		end
+		table.sort(threats, function(x, y) return x.d < y.d end)
+	end
+	if #threats > 0 and ride then
+		local k = (math.floor(os.clock() * 8) % #threats) + 1
+		avatarCF = CFrame.new(threats[k].pos)
+	end
+	setRide(not cutActive)
+	if not ride then avatarCF = nil end
+
+	camPart.Position = headPos + V(0, 0.15 * H, 0)
+	if ride then lp.CameraMinZoomDistance = clamp(H * 0.7, 12, 5000) end
+end
+
+local function applyTargets()
+	for _, s in ipairs(slots) do
+		local p = s.p
+		if p.Parent and s.cf then
+			p.CFrame = s.cf
+			p.AssemblyLinearVelocity = s.vel or V()
+			p.AssemblyAngularVelocity = V()
+		end
+	end
+	if avatarCF and ride and hrp and hrp.Parent then
+		hrp.CFrame = avatarCF
+		hrp.AssemblyLinearVelocity = V()
+		hrp.AssemblyAngularVelocity = V()
+	end
+end
+
+-- GUI ----------------------------------------------------------------------------------------------
+local gui = mk("ScreenGui", {Name = "MechGui", ResetOnSpawn = false, DisplayOrder = 50}, guiParent)
+local GUIGOLD, BG, BTN = Color3.fromRGB(120, 215, 255), Color3.fromRGB(18, 20, 26), Color3.fromRGB(46, 52, 64)
+local GREEN, REDB, BLUEB, ORANGEB = Color3.fromRGB(40, 110, 70), Color3.fromRGB(160, 40, 40), Color3.fromRGB(50, 90, 150), Color3.fromRGB(150, 80, 40)
+
+local FULL_H = math.min(520, math.max(260, cam.ViewportSize.Y - 40))
+local win = mk("Frame", {Size = UDim2.fromOffset(220, FULL_H), Position = UDim2.new(0, 46, 0.5, -FULL_H / 2),
+	BackgroundColor3 = BG, BorderSizePixel = 0, Active = true}, gui)
+round(win, 12)
+mk("UIStroke", {Color = GUIGOLD, Thickness = 2}, win)
+local title = mk("TextLabel", {Size = UDim2.new(1, -60, 0, 28), Position = UDim2.fromOffset(10, 0), BackgroundTransparency = 1,
+	Text = "TITAN MECH", TextColor3 = GUIGOLD, Font = Enum.Font.GothamBold, TextSize = 13, TextXAlignment = Enum.TextXAlignment.Left, Active = true}, win)
+local body = mk("ScrollingFrame", {Size = UDim2.new(1, -8, 1, -34), Position = UDim2.fromOffset(4, 30), BackgroundTransparency = 1,
+	BorderSizePixel = 0, ScrollBarThickness = 4, CanvasSize = UDim2.new()}, win)
+winRef = win
+
+local y = 0
+local function nextRow(h)
+	local r = mk("Frame", {Size = UDim2.new(1, -8, 0, h), Position = UDim2.fromOffset(0, y), BackgroundTransparency = 1}, body)
+	y += h + 6
+	return r
+end
+local function btn(r, text, x, w, cb, color)
+	local b = mk("TextButton", {Size = UDim2.new(w, -3, 1, 0), Position = UDim2.new(x, 1.5, 0, 0), BackgroundColor3 = color or BTN, Text = text,
+		TextColor3 = Color3.new(1, 1, 1), Font = Enum.Font.GothamBold, TextSize = 12, TextWrapped = true}, r)
+	round(b)
+	b.Activated:Connect(function() cb(b) end)
+	return b
+end
+local function box(r, x, w, placeholder, text)
+	local tb = mk("TextBox", {Size = UDim2.new(w, -3, 1, 0), Position = UDim2.new(x, 1.5, 0, 0), BackgroundColor3 = BTN, Text = text or "",
+		PlaceholderText = placeholder, PlaceholderColor3 = Color3.fromRGB(150, 160, 175), TextColor3 = Color3.new(1, 1, 1),
+		Font = Enum.Font.GothamMedium, TextSize = 12, ClearTextOnFocus = false}, r)
+	round(tb)
+	return tb
+end
+local function header(text)
+	local r = nextRow(16)
+	mk("TextLabel", {Size = UDim2.new(1, 0, 1, 0), BackgroundTransparency = 1, Text = text, TextColor3 = GUIGOLD, Font = Enum.Font.GothamBold,
+		TextSize = 12, TextXAlignment = Enum.TextXAlignment.Left}, r)
+end
+
+local summonBtn, controlBtn, nameBox, speedBox, infoLbl, equipBtn
+local slotBtns = {}
+local syncButtons = function() end
+
+local function countBricks()
+	local ok, list, dims = pcall(gather)
+	if not ok or not list then
+		infoLbl.Text = string.format("Needs %d-%d bricks (1x1x3). %s", NEED_MIN, NEED_MAX, ok and tostring(dims) or "scan failed")
+		return
+	end
+	local tier = planTier(#list)
+	infoLbl.Text = string.format("Found %d of %.0fx%.0fx%.0f.\n%s", #list, dims[1], dims[2], dims[3],
+		tier and ("Will build " .. tier.need .. " (" .. tier.tpl .. ")") or ("Need at least " .. NEED_MIN))
+end
+local function toggleSummon()
+	if alive then dismiss() else summon() end
+	syncButtons()
+end
+local function toggleControl()
+	if not alive or cutActive then notify("Spawn first", 3) return end
+	control = not control
+	if control then targetPl = nil end
+	notify(control and "CONTROL on - move with your normal controls" or "Control off", 4)
+	syncButtons()
+end
+local function targetTyped()
+	if not alive or cutActive then notify("Spawn first", 3) return end
+	if control then notify("Turn Control off first", 3) return end
+	if nameBox.Text:match("^%s*$") then notify("Type a player name first", 3) return end
+	local pl = findPlayer(nameBox.Text)
+	if not pl then notify("Player not found: " .. nameBox.Text, 3) return end
+	if not targetHrp(pl) then notify("That player has no character", 3) return end
+	targetPl = pl
+	setGlow("Anger")
+	notify("Targeting: " .. pl.DisplayName, 4)
+end
+local function stopTarget()
+	targetPl = nil
+	if alive and not act and not cutActive then setGlow(baseGlow()) end
+	notify("Target cleared", 2)
+end
+local function applySpeed()
+	local n = tonumber((speedBox.Text:gsub("[^%d%.]", "")))
+	if not n then
+		notify("Type a speed number, e.g. 40", 3)
+		speedBox.Text = tostring(SPEED)
+		return
+	end
+	SPEED = clamp(n, 1, 1000)
+	speedBox.Text = tostring(SPEED)
+	notify("Speed " .. SPEED .. " (x size)", 2)
+end
+local function setSize(n)
+	n = clamp(math.floor((tonumber(n) or 1) * 10 + 0.5) / 10, 1, 10)
+	scTarget = n
+	sizeBox.Text = tostring(n)
+	notify(string.format("Size %gx", n), 2)
+end
+local function unload()
+	for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
+	pcall(function() RunService:UnbindFromRenderStep("NoseyShake") end)
+	dismiss()
+	fxOff()
+	gui:Destroy()
+	cine:Destroy()
+	_G.NoseyBrick = nil
+end
+_G.NoseyBrick = unload
+
+do
+	summonBtn = btn(nextRow(32), "Summon", 0, 1, toggleSummon, GREEN)
+	local rsz = nextRow(26)
+	mk("TextLabel", {Size = UDim2.new(0.3, 0, 1, 0), BackgroundTransparency = 1, Text = "Size", TextColor3 = Color3.new(1, 1, 1),
+		Font = Enum.Font.GothamMedium, TextSize = 12, TextXAlignment = Enum.TextXAlignment.Left}, rsz)
+	btn(rsz, "-", 0.3, 0.17, function() setSize((tonumber(sizeBox.Text) or 1) - 1) end)
+	sizeBox = box(rsz, 0.47, 0.36, "1-10", "1")
+	sizeBox.FocusLost:Connect(function() setSize(sizeBox.Text) end)
+	btn(rsz, "+", 0.83, 0.17, function() setSize((tonumber(sizeBox.Text) or 1) + 1) end)
+	local r1 = nextRow(28)
+	equipBtn = btn(r1, "Equip sword [E]", 0, 0.5, function() runSkill("Equip") end, BLUEB)
+	btn(r1, "Laser [L]", 0.5, 0.5, function() runSkill("Laser") end, REDB)
+	controlBtn = btn(nextRow(28), "Control: OFF", 0, 1, toggleControl)
+	local rs = nextRow(24)
+	mk("TextLabel", {Size = UDim2.new(0.38, 0, 1, 0), BackgroundTransparency = 1, Text = "Speed", TextColor3 = Color3.new(1, 1, 1),
+		Font = Enum.Font.GothamMedium, TextSize = 12, TextXAlignment = Enum.TextXAlignment.Left}, rs)
+	speedBox = box(rs, 0.38, 0.62, "any number", tostring(SPEED))
+	speedBox.FocusLost:Connect(applySpeed)
+	header("Target player")
+	nameBox = box(nextRow(24), 0, 1, "Type player name")
+	local rt = nextRow(28)
+	btn(rt, "Target", 0, 0.5, targetTyped, REDB)
+	btn(rt, "Stop", 0.5, 0.5, stopTarget, BLUEB)
+	header("Abilities")
+	local a1, a2 = nextRow(28), nextRow(28)
+	slotBtns.Q = btn(a1, "Shot [Q]", 0, 0.5, function() useSlot("Q") end, ORANGEB)
+	slotBtns.F = btn(a1, "Punch [F]", 0.5, 0.5, function() useSlot("F") end, ORANGEB)
+	slotBtns.R = btn(a2, "Roar [R]", 0, 0.5, function() useSlot("R") end, ORANGEB)
+	slotBtns.G = btn(a2, "Slam [G]", 0.5, 0.5, function() useSlot("G") end, ORANGEB)
+	btn(nextRow(26), "Reload [T]", 0, 1, function() runSkill("Reload") end, Color3.fromRGB(80, 70, 40))
+	local ri = nextRow(40)
+	infoLbl = mk("TextLabel", {Size = UDim2.new(1, -8, 1, 0), BackgroundColor3 = Color3.fromRGB(28, 31, 38), Text = "", TextColor3 = Color3.new(1, 1, 1),
+		Font = Enum.Font.Code, TextSize = 11, TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top}, ri)
+	round(infoLbl)
+	btn(nextRow(24), "Check bricks", 0, 1, countBricks)
+	btn(nextRow(24), "Unload script", 0, 1, function() unload() end, REDB)
+end
+statusLbl = mk("TextLabel", {Size = UDim2.new(1, -8, 0, 54), Position = UDim2.fromOffset(0, y), BackgroundTransparency = 1, Text = "",
+	TextColor3 = Color3.fromRGB(170, 190, 210), Font = Enum.Font.Gotham, TextSize = 10, TextWrapped = true,
+	TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top}, body)
+body.CanvasSize = UDim2.fromOffset(0, y + 62)
+
+syncButtons = function()
+	summonBtn.Text = alive and "Dismiss" or "Summon"
+	summonBtn.BackgroundColor3 = alive and REDB or GREEN
+	controlBtn.Text = "Control: " .. (control and "ON" or "OFF")
+	controlBtn.BackgroundColor3 = control and GREEN or BLUEB
+	equipBtn.Text = equipped and "Stow sword [E]" or "Equip sword [E]"
+	local ix = equipped and 2 or 1
+	local names = {Q = {"Shot", "Spin"}, F = {"Punch", "Slash"}, R = {"Roar", "Pose"}, G = {"Slam", "Slam"}}
+	for k, bt in pairs(slotBtns) do bt.Text = names[k][ix] .. " [" .. k .. "]" end
+end
+
+local function headerBtn(text, x, cb)
+	local b = mk("TextButton", {Size = UDim2.fromOffset(22, 20), Position = UDim2.new(1, x, 0, 4), BackgroundColor3 = BTN, Text = text,
+		TextColor3 = Color3.new(1, 1, 1), Font = Enum.Font.GothamBold, TextSize = 14}, win)
+	round(b, 6)
+	b.Activated:Connect(cb)
+end
+local minimized = false
+headerBtn("-", -48, function()
+	minimized = not minimized
+	body.Visible = not minimized
+	win.Size = UDim2.fromOffset(220, minimized and 28 or FULL_H)
+end)
+headerBtn("x", -25, function() win.Visible = false end)
+local openBtn = mk("TextButton", {Size = UDim2.fromOffset(34, 34), Position = UDim2.new(0, 6, 0.5, -17), BackgroundColor3 = BG, Text = "M",
+	TextColor3 = GUIGOLD, Font = Enum.Font.GothamBlack, TextSize = 16, ZIndex = 5}, gui)
+round(openBtn, 17)
+mk("UIStroke", {Color = GUIGOLD, Thickness = 2}, openBtn)
+openBtn.Activated:Connect(function() win.Visible = not win.Visible end)
+openRef = openBtn
+
+do -- drag by title
+	local dragging, startPos, startIn
+	title.InputBegan:Connect(function(i)
+		if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+			dragging, startPos, startIn = true, win.Position, i.Position
+		end
+	end)
+	table.insert(conns, UIS.InputChanged:Connect(function(i)
+		if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
+			local d = i.Position - startIn
+			win.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+		end
+	end))
+	table.insert(conns, UIS.InputEnded:Connect(function(i)
+		if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then dragging = false end
+	end))
+end
+
+-- input / loops ------------------------------------------------------------------------------------
+table.insert(conns, UIS.InputBegan:Connect(function(i, gp)
+	if gp then return end
+	local k = i.KeyCode
+	if k == Enum.KeyCode.RightControl then win.Visible = not win.Visible
+	elseif k == Enum.KeyCode.Q then useSlot("Q")
+	elseif k == Enum.KeyCode.F then useSlot("F")
+	elseif k == Enum.KeyCode.R then useSlot("R")
+	elseif k == Enum.KeyCode.G then useSlot("G")
+	elseif k == Enum.KeyCode.L then runSkill("Laser")
+	elseif k == Enum.KeyCode.E then runSkill("Equip")
+	elseif k == Enum.KeyCode.T then runSkill("Reload") end
+end))
+table.insert(conns, lp.CharacterAdded:Connect(function(c)
+	refChar(c)
+	if alive then
+		refreshFilters()
+		if ride then carryAvatar(true); cam.CameraSubject = camPart end
+	end
+end))
+table.insert(conns, RunService.RenderStepped:Connect(function(dt)
+	if alive and camPart and geo then
+		local ok, err = pcall(step, math.min(dt, 0.033))
+		if not ok then
+			errT += dt
+			if errT > 0.5 then errT = 0; notify("script error: " .. tostring(err), 6); warn("[Mech] " .. tostring(err)) end
+		end
+		filT += dt
+		if filT > 2 then filT = 0; refreshFilters() end
+	end
+	updateDebris(dt)
+	statT += dt
+	if statT > 0.5 then
+		statT = 0
+		syncButtons()
+		if os.clock() > noticeUntil then
+			if alive then
+				local st = act and act:upper() or (targetPl and ("Targeting " .. targetPl.DisplayName)) or (control and "Controlled") or "Idle"
+				statusLbl.Text = string.format("%s | %d bricks | %gx | ammo %d/10%s", st, curNeed, scTarget, ammoReady(), equipped and " | SWORD" or "")
+			else
+				statusLbl.Text = string.format("Ready | uses %d to %d of your 1x1x3 bricks", NEED_MIN, NEED_MAX)
+			end
+		end
+	end
+end))
+table.insert(conns, RunService.Heartbeat:Connect(function() if alive then applyTargets() end end))
+table.insert(conns, RunService.Stepped:Connect(function() if alive then applyTargets() end end))
+
+pcall(countBricks)
+print("[TITAN MECH] loaded - nothing moves until you press Summon")

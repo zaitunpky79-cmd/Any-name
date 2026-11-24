@@ -1,0 +1,1890 @@
+--[[ ARCHANGEL MICHAEL  -  FE brick angel for Delta / any executor
+  210 bricks from workspace.Bricks.master_ofbuilds (fallback: workspace.Bricks[<your username>]):  100 body + 110 effects.
+  TEN brick sizes are used (sorted dimensions; 2x4x2 / 4x2x2 are the same as 2x2x4 etc.):
+
+      1x1x1 (C)   1x1x2 (K)   1x1x4 (R)   1x2x2 (P)   1x2x4 (Q)   2x2x2 (M)   2x2x4 (D)   1x4x4 (T)   2x4x4 (V)   4x4x4 (L)
+
+  BODY (100, counted by the script from the model): armor, helm + halo, two big stepped wings, R6-style limbs,
+      and his sword (20 bricks: blade, guard, grip, pommel, glowing runes).
+  EFFECTS (110): L16 V10 T10 D16 Q12 M10 P8 R12 K8 C8 - parked underground, borrowed by the skills and the cutscene.
+
+  CUTSCENE (about 20 s, Skip button): the sky darkens -> a huge BEAM OF LIGHT made of bricks shoots down ->
+      it opens and reveals Michael KNEELING with his sword planted in the ground -> he grips it, pulls it out,
+      rises with wings spreading -> he speaks:  "I..."  "Archangel Michael..."  "Angel of all angels..."
+      (edit CFG.SPEECH below to change the words)
+  SKILLS: Slash | Sword Beam | Teleport behind people | Pose (kneel) | Fly | Fly Slash | Fly Beam   (keys 1-7)
+  BUTTONS: Summon | Control (move him, camera follows; on-screen pad with UP/DOWN while flying) | Fly | Kneel | Target
+  BRICK CHECK: [OK] [!] too many (unused)  [X] not enough (summon is blocked, tells you how many are missing),
+      anchored/welded bricks that cannot be used, and the closest wrong size it found.
+  FE: brick movement is seen by everyone. Light shafts, text, rings, lighting and shakes are local.
+]]
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UIS = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local Debris = game:GetService("Debris")
+local Lighting = game:GetService("Lighting")
+local SoundService = game:GetService("SoundService")
+local lp = Players.LocalPlayer
+local cam = workspace.CurrentCamera
+
+if _G.ArchangelMichael then pcall(_G.ArchangelMichael) end
+
+local V = Vector3.new
+local TAU = math.pi * 2
+local HALF = math.pi / 2
+
+local CFG = {
+	PATH = {"Bricks", "master_ofbuilds"}, -- workspace.Bricks.master_ofbuilds
+	TOL = 0.15, -- how much a brick size may differ from the wanted size (studs)
+	WALK = 20, FLY = 70, -- walking / flying speed (studs per second)
+	SPEECH = {"I...", "Archangel Michael...", "Angel of all angels..."},
+}
+local TYPES = {
+	{id = "C", dims = {1, 1, 1}}, {id = "K", dims = {1, 1, 2}}, {id = "R", dims = {1, 1, 4}}, {id = "P", dims = {1, 2, 2}},
+	{id = "Q", dims = {1, 2, 4}}, {id = "M", dims = {2, 2, 2}}, {id = "D", dims = {2, 2, 4}}, {id = "T", dims = {1, 4, 4}},
+	{id = "V", dims = {2, 4, 4}}, {id = "L", dims = {4, 4, 4}},
+}
+local EFFECT = {L = 16, V = 10, T = 10, D = 16, Q = 12, M = 10, P = 8, R = 12, K = 8, C = 8} -- 110 effect bricks
+local SFX = {
+	slash = {id = nil, file = "rbxasset://sounds/swordslash.wav", speed = 0.8, vol = 1.3},
+	beam = {id = nil, file = "rbxasset://sounds/electronicpingshort.wav", speed = 0.5, vol = 1.3},
+	holy = {id = nil, file = "rbxasset://sounds/electronicpingshort.wav", speed = 1.6, vol = 0.9},
+	boom = {id = nil, file = "rbxasset://sounds/bass.wav", speed = 0.6, vol = 2.0},
+	wing = {id = nil, file = "rbxasset://sounds/impact_water.mp3", speed = 1.8, vol = 0.8},
+	tp = {id = nil, file = "rbxasset://sounds/snap.mp3", speed = 0.9, vol = 1.3},
+}
+local COL = {
+	GOLD = Color3.fromRGB(255, 214, 110), LIGHT = Color3.fromRGB(255, 246, 205), WHITE = Color3.fromRGB(250, 248, 240),
+	ARMOR = Color3.fromRGB(230, 226, 216), ARMOR2 = Color3.fromRGB(190, 186, 178), TRIM = Color3.fromRGB(235, 185, 70),
+	BLUE = Color3.fromRGB(70, 110, 190), WING = Color3.fromRGB(245, 242, 235), WING2 = Color3.fromRGB(215, 210, 200),
+	BLADE = Color3.fromRGB(235, 240, 250), GRIP = Color3.fromRGB(110, 70, 40), SKY = Color3.fromRGB(255, 240, 190),
+}
+
+local S = {
+	alive = false, cut = false, skip = false, busy = false, dismissing = false,
+	slots = {}, body = {}, swSlots = {}, pool = {}, saved = {}, fxFree = {}, bones = {}, order = {}, world = {}, info = {},
+	pos = V(), gy = 0, hd = 0, vel = V(), curSp = 0, h = 0, flyTarget = 24, faceH = nil, dash = nil, hold = nil,
+	pose = {}, poseT = {}, poseRate = 7, gt = {ph = 0, gait = 0},
+	flying = false, kneel = false, kneelK = 0, wingS = 0.8, swPlant = 0, bodyVis = true, control = false,
+	act = nil, targetPl = nil, flare = 0, shakeAmp = 0, shakeEnd = 0, headPos = V(), bodyPos = V(), swTip = V(), swCF = CFrame.new(),
+	noticeUntil = 0, conns = {}, statT = 0, errT = 0, lostT = 0, lostN = 0, aiT = 0,
+	camFn = nil, camT0 = 0, walk = nil, statusLbl = nil, camPart = nil, sfxOn = true, cc = nil, amb = nil,
+	pad = {f = false, b = false, l = false, r = false, u = false, d = false},
+}
+for _, k in ipairs({"armL", "armR", "foreL", "foreR", "armLz", "armRz", "lean", "twist", "head", "flap", "dive"}) do
+	S.pose[k] = 0
+	S.poseT[k] = 0
+end
+
+local function clamp(x, a, b) return math.clamp(x, a, b) end
+local function smooth(x) x = clamp(x, 0, 1); return x * x * (3 - 2 * x) end
+local function mix(a, b, k) return a + (b - a) * k end
+local function adiff(a, b) return (a - b + math.pi) % TAU - math.pi end
+local function notify(txt, secs)
+	if S.statusLbl then S.statusLbl.Text = txt end
+	S.noticeUntil = os.clock() + (secs or 3)
+end
+
+local char, hrp, hum
+local function refChar(c)
+	char = c
+	hrp = c:WaitForChild("HumanoidRootPart")
+	hum = c:WaitForChild("Humanoid")
+end
+refChar(lp.Character or lp.CharacterAdded:Wait())
+
+local groundP = RaycastParams.new()
+groundP.FilterType = Enum.RaycastFilterType.Exclude
+groundP.RespectCanCollide = true
+local function groundAt(p, h)
+	local res = workspace:Raycast(p + V(0, h, 0), V(0, -(h + 3000), 0), groundP)
+	return res and res.Position.Y or p.Y
+end
+local function refreshFilters()
+	local f = {char}
+	for _, p in ipairs(S.pool) do f[#f + 1] = p end
+	if S.camPart then f[#f + 1] = S.camPart end
+	for _, pl in ipairs(Players:GetPlayers()) do
+		if pl.Character then f[#f + 1] = pl.Character end
+	end
+	groundP.FilterDescendantsInstances = f
+end
+local function sfx(name, volMul, speedMul)
+	if not S.sfxOn then return end
+	local d = SFX[name]
+	if not d then return end
+	pcall(function()
+		local s = Instance.new("Sound")
+		s.SoundId = d.id or d.file
+		s.Volume = clamp((d.vol or 1) * (volMul or 1), 0, 10)
+		s.PlaybackSpeed = (d.speed or 1) * (speedMul or 1)
+		s.Parent = SoundService
+		s:Play()
+		Debris:AddItem(s, 8)
+	end)
+end
+
+-- LAYOUT: Michael, brick by brick. rig units are studs, origin on the ground under the hips, he faces -Z, +Y is up ----------------------------------------
+-- `code` = which rig axis each brick dimension (shortest, middle, longest) lies along, e.g. "xzy" = long side vertical.
+local function bodyCells()
+	local bones, order, cells = {}, {}, {}
+	local function bone(n, par, pv) bones[n] = {parent = par, pv = pv}; order[#order + 1] = n end
+	local function put(tp, bn, pos, code, color, tag) cells[#cells + 1] = {tp = tp, bone = bn, pos = pos, code = code or "xzy", color = color, tag = tag or "armor"} end
+	bone("Root", nil, V(0, 10, 0))
+	bone("Torso", "Root", V(0, 12, 0))
+	bone("Head", "Torso", V(0, 18, 0))
+	for _, sd in ipairs({-1, 1}) do
+		local d = sd < 0 and "L" or "R"
+		bone("Arm" .. d, "Torso", V(sd * 3.5, 17, 0))
+		bone("Fore" .. d, "Arm" .. d, V(sd * 3.5, 13, 0))
+		bone("Thigh" .. d, "Root", V(sd * 1, 10, 0))
+		bone("Shin" .. d, "Thigh" .. d, V(sd * 1, 6, 0))
+		bone("Foot" .. d, "Shin" .. d, V(sd * 1, 2, 0))
+		bone("WingA" .. d, "Torso", V(sd * 2, 17, 2.5))
+		bone("WingB" .. d, "WingA" .. d, V(sd * 7.5, 19, 3))
+		bone("WingC" .. d, "WingB" .. d, V(sd * 12.5, 22, 3.5))
+	end
+	-- pelvis, tassets, loincloth
+	put("D", "Root", V(0, 11, 0), "yzx", COL.TRIM, "trim")
+	put("P", "Root", V(-2.5, 10.5, 0), "xzy", COL.ARMOR2)
+	put("P", "Root", V(2.5, 10.5, 0), "xzy", COL.ARMOR2)
+	put("T", "Root", V(0, 9, -1.4), "zxy", COL.BLUE, "cloth")
+	put("T", "Root", V(0, 9, 1.4), "zxy", COL.BLUE, "cloth")
+	-- torso
+	put("D", "Torso", V(0, 13, 0), "yzx", COL.ARMOR2)
+	put("L", "Torso", V(0, 16, 0), "xzy", COL.ARMOR)
+	put("P", "Torso", V(0, 16.3, -2.5), "zxy", COL.GOLD, "glow") -- chest emblem
+	for _, x in ipairs({-1.2, 1.2}) do
+		put("K", "Torso", V(x, 15.3, -2.2), "xzy", COL.TRIM, "trim")
+		put("K", "Torso", V(x, 17.3, -2.2), "xzy", COL.TRIM, "trim")
+	end
+	for x = -2.5, 2.5, 1 do put("C", "Torso", V(x, 12.4, -1.2), "xzy", COL.GOLD, "glow") end -- belt studs
+	-- head, halo
+	put("M", "Head", V(0, 19, 0), "xzy", COL.ARMOR)
+	put("P", "Head", V(0, 19, -1.4), "zxy", COL.GOLD, "glow") -- visor
+	put("Q", "Head", V(0, 22.5, 0.3), "zxy", COL.TRIM, "trim") -- plume
+	put("C", "Head", V(-0.5, 19.3, -2.1), "xzy", COL.WHITE, "glow")
+	put("C", "Head", V(0.5, 19.3, -2.1), "xzy", COL.WHITE, "glow")
+	put("C", "Head", V(0, 18.3, -1.2), "xzy", COL.GOLD, "glow") -- chin stud
+	for _, z in ipairs({-2.2, 2.2}) do put("R", "Head", V(0, 25.5, z), "yzx", COL.LIGHT, "halo") end
+	for _, x in ipairs({-2.2, 2.2}) do put("R", "Head", V(x, 25.5, 0), "xyz", COL.LIGHT, "halo") end
+	for _, x in ipairs({-2.2, 2.2}) do
+		for _, z in ipairs({-2.2, 2.2}) do put("C", "Head", V(x, 25.5, z), "xzy", COL.WHITE, "halo") end
+	end
+	for _, sd in ipairs({-1, 1}) do
+		local d = sd < 0 and "L" or "R"
+		-- arms
+		put("V", "Arm" .. d, V(sd * 3.5, 18.5, 0), "yxz", COL.ARMOR) -- pauldron
+		put("C", "Arm" .. d, V(sd * 3.5 - 1, 19.7, -1), "xzy", COL.GOLD, "glow")
+		put("C", "Arm" .. d, V(sd * 3.5 + 1, 19.7, 1), "xzy", COL.GOLD, "glow")
+		put("D", "Arm" .. d, V(sd * 3.5, 15, 0), "xzy", COL.ARMOR2)
+		put("D", "Fore" .. d, V(sd * 3.5, 11, 0), "xzy", COL.ARMOR)
+		put("Q", "Fore" .. d, V(sd * 3.5, 11, -1.5), "zxy", COL.TRIM, "trim") -- bracer
+		put("M", "Fore" .. d, V(sd * 3.5, 8, 0), "xzy", COL.ARMOR2)
+		put("K", "Fore" .. d, V(sd * 3.5, 9.5, -1.2), "xzy", COL.GOLD, "glow")
+		-- legs
+		put("D", "Thigh" .. d, V(sd * 1, 8, 0), "xzy", COL.ARMOR2)
+		put("D", "Shin" .. d, V(sd * 1, 4, 0), "xzy", COL.ARMOR)
+		put("Q", "Shin" .. d, V(sd * 1, 4, -1.5), "zxy", COL.TRIM, "trim")
+		put("P", "Shin" .. d, V(sd * 1, 6.3, -1.5), "zxy", COL.ARMOR)
+		put("D", "Foot" .. d, V(sd * 1, 1, -1), "xyz", COL.TRIM, "trim")
+		-- wings (stepped panels + feather tips)
+		put("M", "WingA" .. d, V(sd * 3, 17, 2.8), "xzy", COL.TRIM, "trim")
+		put("V", "WingA" .. d, V(sd * 5.5, 19, 3.2), "zxy", COL.WING, "wing")
+		put("Q", "WingA" .. d, V(sd * 4, 14.5, 2.6), "zxy", COL.WING2, "wing")
+		put("V", "WingB" .. d, V(sd * 9.5, 21, 3.4), "zxy", COL.WING, "wing")
+		put("T", "WingB" .. d, V(sd * 9.5, 25.5, 3.4), "zxy", COL.WING2, "wing")
+		put("Q", "WingB" .. d, V(sd * 8, 16.5, 3), "zxy", COL.WING2, "wing")
+		put("T", "WingC" .. d, V(sd * 13.5, 24, 3.6), "zxy", COL.WING, "wing")
+		for j = 0, 3 do put("R", "WingC" .. d, V(sd * 17.5, 21.5 + 1.5 * j, 3.6), "yzx", COL.WING, "wing") end
+	end
+	return bones, order, cells
+end
+-- the sword: local frame, origin = centre of the grip, blade along +Y
+local function swordCells()
+	local c = {}
+	local function put(tp, pos, code, color, tag) c[#c + 1] = {tp = tp, pos = pos, code = code or "xzy", color = color, tag = tag or "blade"} end
+	put("R", V(0, 0, 0), "xzy", COL.GRIP, "grip")
+	put("M", V(0, -3, 0), "xzy", COL.TRIM, "trim")
+	put("M", V(0, 3.6, -1.7), "xzy", COL.SKY, "glow") -- gem
+	put("D", V(0, 2.5, 0), "yzx", COL.TRIM, "trim") -- crossguard
+	put("C", V(-2.6, 3.2, 0), "xzy", COL.GOLD, "glow")
+	put("C", V(2.6, 3.2, 0), "xzy", COL.GOLD, "glow")
+	for _, x in ipairs({-0.5, 0.5}) do
+		for j = 1, 4 do put("R", V(x, 5.5 + 4 * (j - 1), 0), "xzy", COL.BLADE, "blade") end
+	end
+	put("K", V(0, 20.5, 0), "xzy", COL.BLADE, "blade")
+	put("K", V(0, 22.5, 0), "xzy", COL.BLADE, "blade")
+	for _, y in ipairs({7, 11, 15, 19}) do put("C", V(0, y, -0.7), "xzy", COL.GOLD, "glow") end
+	return c
+end
+local NEED, TOTAL = {}, 0
+do
+	for _, t in ipairs(TYPES) do NEED[t.id] = 0 end
+	local _, _, cells = bodyCells()
+	for _, c in ipairs(cells) do NEED[c.tp] += 1 end
+	for _, c in ipairs(swordCells()) do NEED[c.tp] += 1 end
+	for tp, n in pairs(EFFECT) do NEED[tp] += n end
+	for _, t in ipairs(TYPES) do TOTAL += NEED[t.id] end
+end
+
+-- BRICK DETECTION --------------------------------------------------------------------------------------------------------------------------------------
+local function getFolder()
+	local f = workspace
+	for _, n in ipairs(CFG.PATH) do f = f and f:FindFirstChild(n) end
+	if f then return f end
+	local b = workspace:FindFirstChild("Bricks")
+	return b and (b:FindFirstChild(lp.Name) or b:FindFirstChild(lp.DisplayName)) or nil
+end
+local function owned(p)
+	if not isnetworkowner then return true end
+	local ok, r = pcall(isnetworkowner, p)
+	return (not ok) or r
+end
+local function usable(p)
+	if not p or not p.Parent or p:IsDescendantOf(char) then return false end
+	if p.Anchored then return false end
+	local okJ, joints = pcall(function() return p:GetJoints() end)
+	if okJ and #joints > 0 then return false end
+	return true
+end
+local function dimsMatch(a, b)
+	return math.abs(a[1] - b[1]) < CFG.TOL and math.abs(a[2] - b[2]) < CFG.TOL and math.abs(a[3] - b[3]) < CFG.TOL
+end
+local function dimsName(d)
+	return string.format("%gx%gx%g", math.floor(d[1] * 10 + 0.5) / 10, math.floor(d[2] * 10 + 0.5) / 10, math.floor(d[3] * 10 + 0.5) / 10)
+end
+local function scan()
+	local folder = getFolder()
+	if not folder then return nil, "workspace.Bricks.master_ofbuilds not found" end
+	local byType, other, unusable = {}, {}, {}
+	for _, t in ipairs(TYPES) do byType[t.id] = {}; unusable[t.id] = 0 end
+	local base = hrp.Position
+	for _, d in ipairs(folder:GetDescendants()) do
+		if d:IsA("BasePart") and d.Parent and not d:IsDescendantOf(char) then
+			local sz = d.Size
+			local a = {sz.X, sz.Y, sz.Z}
+			table.sort(a)
+			local tid
+			for _, t in ipairs(TYPES) do
+				if dimsMatch(a, t.dims) then tid = t.id break end
+			end
+			if usable(d) then
+				if tid then
+					local l = byType[tid]
+					l[#l + 1] = {d, (d.Position - base).Magnitude, owned(d) and 0 or 1}
+				else
+					local key = dimsName(a)
+					if not other[key] then other[key] = {n = 0, dims = a, key = key} end
+					other[key].n += 1
+				end
+			elseif tid then
+				unusable[tid] += 1
+			end
+		end
+	end
+	for _, l in pairs(byType) do
+		table.sort(l, function(x, y)
+			if x[3] ~= y[3] then return x[3] < y[3] end
+			return x[2] < y[2]
+		end)
+	end
+	return byType, other, unusable
+end
+local function diagnose(byType, other, unusable)
+	local lines, ok = {}, true
+	local otherList = {}
+	for _, g in pairs(other) do otherList[#otherList + 1] = g end
+	table.sort(otherList, function(x, y) return x.n > y.n end)
+	for _, t in ipairs(TYPES) do
+		local need, have = NEED[t.id], #byType[t.id]
+		local nm = dimsName(t.dims)
+		if have < need then
+			ok = false
+			lines[#lines + 1] = string.format("[X] %s: need %d, have %d -> %d MISSING", nm, need, have, need - have)
+			local best, bd
+			for _, g in ipairs(otherList) do
+				local dist = math.abs(g.dims[1] - t.dims[1]) + math.abs(g.dims[2] - t.dims[2]) + math.abs(g.dims[3] - t.dims[3])
+				if not bd or dist < bd then best, bd = g, dist end
+			end
+			if best then lines[#lines + 1] = string.format("    wrong size nearby: %s x%d", best.key, best.n) end
+		elseif have > need then
+			lines[#lines + 1] = string.format("[!] %s: need %d, have %d (%d extra, unused)", nm, need, have, have - need)
+		else
+			lines[#lines + 1] = string.format("[OK] %s: need %d, have %d", nm, need, have)
+		end
+		if unusable[t.id] > 0 then
+			lines[#lines + 1] = string.format("    %d more %s are anchored/welded (cannot use)", unusable[t.id], nm)
+		end
+	end
+	if #otherList > 0 then
+		local parts = {}
+		for i = 1, math.min(3, #otherList) do parts[#parts + 1] = otherList[i].key .. " x" .. otherList[i].n end
+		lines[#lines + 1] = "other sizes in your folder: " .. table.concat(parts, ", ")
+	end
+	return ok, lines
+end
+local AXV = {x = V(1, 0, 0), y = V(0, 1, 0), z = V(0, 0, 1)}
+local function orientFor(p, code)
+	code = code or "xzy"
+	local sz = {p.Size.X, p.Size.Y, p.Size.Z}
+	local idx = {1, 2, 3}
+	table.sort(idx, function(a, b) return sz[a] < sz[b] end)
+	local ax = {}
+	for k = 1, 3 do ax[idx[k]] = AXV[code:sub(k, k)] end
+	return CFrame.fromMatrix(V(), ax[1], ax[2])
+end
+local function yAxisCF(pos, y, ref)
+	if y.Magnitude < 1e-4 then return CFrame.new(pos) end
+	y = y.Unit
+	local x = ref:Cross(y)
+	if x.Magnitude < 1e-3 then x = V(1, 0, 0):Cross(y) end
+	if x.Magnitude < 1e-3 then x = V(0, 0, 1):Cross(y) end
+	return CFrame.fromMatrix(pos, x.Unit, y)
+end
+
+-- GUI roots + cutscene labels ------------------------------------------------------------------------------------------------------------------------------
+local guiParent
+do
+	local ok, g = pcall(function() return (gethui and gethui()) end)
+	guiParent = (ok and g) or lp:WaitForChild("PlayerGui")
+end
+local function mk(class, props, parent)
+	local o = Instance.new(class)
+	for k, v in pairs(props) do o[k] = v end
+	o.Parent = parent
+	return o
+end
+local function round(o, r) mk("UICorner", {CornerRadius = UDim.new(0, r or 8)}, o) end
+local CN = {}
+CN.cine = mk("ScreenGui", {Name = "MichaelCine", ResetOnSpawn = false, IgnoreGuiInset = true, DisplayOrder = 60}, guiParent)
+CN.fade = mk("Frame", {Size = UDim2.new(1, 0, 1, 0), BackgroundColor3 = Color3.new(0, 0, 0), BorderSizePixel = 0, ZIndex = 9, Visible = false}, CN.cine)
+CN.flash = mk("Frame", {Size = UDim2.new(1, 0, 1, 0), BackgroundColor3 = Color3.new(1, 1, 1), BackgroundTransparency = 1, BorderSizePixel = 0, ZIndex = 16}, CN.cine)
+CN.barTop = mk("Frame", {Size = UDim2.new(1, 0, 0, 0), BackgroundColor3 = Color3.new(0, 0, 0), BorderSizePixel = 0, Visible = false, ZIndex = 10}, CN.cine)
+CN.barBot = mk("Frame", {Size = UDim2.new(1, 0, 0, 0), AnchorPoint = Vector2.new(0, 1), Position = UDim2.new(0, 0, 1, 0),
+	BackgroundColor3 = Color3.new(0, 0, 0), BorderSizePixel = 0, Visible = false, ZIndex = 10}, CN.cine)
+CN.title = mk("TextLabel", {Size = UDim2.new(1, 0, 0, 56), Position = UDim2.new(0, 0, 0.56, 0), BackgroundTransparency = 1, Text = "",
+	TextColor3 = COL.GOLD, Font = Enum.Font.GothamBlack, TextSize = 44, TextTransparency = 1, TextStrokeTransparency = 1, Visible = false, ZIndex = 12}, CN.cine)
+CN.sub = mk("TextLabel", {Size = UDim2.new(1, 0, 0, 22), Position = UDim2.new(0, 0, 0.56, 58), BackgroundTransparency = 1, Text = "",
+	TextColor3 = Color3.fromRGB(250, 245, 225), Font = Enum.Font.GothamMedium, TextSize = 15, TextTransparency = 1, TextStrokeTransparency = 1, Visible = false, ZIndex = 12}, CN.cine)
+CN.speech = mk("TextLabel", {Size = UDim2.new(1, 0, 0, 40), AnchorPoint = Vector2.new(0, 1), Position = UDim2.new(0, 0, 0.86, 0), BackgroundTransparency = 1, Text = "",
+	TextColor3 = COL.LIGHT, Font = Enum.Font.GothamMedium, TextSize = 26, TextTransparency = 0, TextStrokeTransparency = 0.4, ZIndex = 13}, CN.cine)
+CN.shout = mk("TextLabel", {Size = UDim2.new(1, 0, 0, 52), Position = UDim2.new(0, 0, 0.14, 0), BackgroundTransparency = 1, Text = "",
+	TextColor3 = COL.GOLD, Font = Enum.Font.GothamBlack, TextSize = 34, TextTransparency = 1, TextStrokeTransparency = 1, ZIndex = 13}, CN.cine)
+CN.skipBtn = mk("TextButton", {Size = UDim2.fromOffset(92, 30), AnchorPoint = Vector2.new(1, 1), Position = UDim2.new(1, -16, 1, -16),
+	BackgroundColor3 = Color3.new(0, 0, 0), BackgroundTransparency = 0.35, Text = "Skip >>", TextColor3 = Color3.new(1, 1, 1),
+	Font = Enum.Font.GothamMedium, TextSize = 12, Visible = false, ZIndex = 20}, CN.cine)
+round(CN.skipBtn, 8)
+CN.skipBtn.Activated:Connect(function() S.skip = true end)
+local function fadeText(l, to, secs)
+	TweenService:Create(l, TweenInfo.new(secs), {TextTransparency = to, TextStrokeTransparency = (to >= 1) and 1 or 0.4}):Play()
+end
+local function shout(text, color)
+	CN.shout.Text = text
+	CN.shout.TextColor3 = color or COL.GOLD
+	CN.shout.TextTransparency, CN.shout.TextStrokeTransparency = 0, 0.3
+	TweenService:Create(CN.shout, TweenInfo.new(1.3, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {TextTransparency = 1, TextStrokeTransparency = 1}):Play()
+end
+local function titleCard(t1, t2)
+	CN.title.Text, CN.sub.Text = t1, t2
+	CN.title.Visible, CN.sub.Visible = true, true
+	fadeText(CN.title, 0, 0.8)
+	fadeText(CN.sub, 0.15, 1.0)
+end
+local function flashScreen(a, color)
+	CN.flash.BackgroundColor3 = color or Color3.new(1, 1, 1)
+	CN.flash.BackgroundTransparency = 1 - (a or 0.6)
+	TweenService:Create(CN.flash, TweenInfo.new(0.5), {BackgroundTransparency = 1}):Play()
+end
+
+-- local effects -----------------------------------------------------------------------------------------------------------------------------------------------
+RunService:BindToRenderStep("MichaelShake", Enum.RenderPriority.Camera.Value + 1, function()
+	local left = S.shakeEnd - os.clock()
+	if left > 0 and not S.cut then
+		local a = S.shakeAmp * math.min(1, left)
+		cam.CFrame = cam.CFrame * CFrame.new((math.random() - 0.5) * a, (math.random() - 0.5) * a, 0)
+	end
+end)
+local function shakeFrom(pos, power, secs, range)
+	local k = clamp(1 - (cam.CFrame.Position - pos).Magnitude / range, 0, 1)
+	if k > 0 then S.shakeAmp, S.shakeEnd = power * k, os.clock() + secs end
+end
+local function ring(pos, radius, color, secs)
+	local p = Instance.new("Part")
+	p.Anchored, p.CanCollide, p.CanQuery, p.CanTouch = true, false, false, false
+	p.Shape = Enum.PartType.Cylinder
+	p.Material = Enum.Material.Neon
+	p.Color = color or COL.GOLD
+	p.Transparency = 0.3
+	p.Size = V(0.8, 2, 2)
+	p.CFrame = CFrame.new(pos + V(0, 0.5, 0)) * CFrame.Angles(0, 0, HALF)
+	p.Parent = workspace
+	TweenService:Create(p, TweenInfo.new(secs or 0.8, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {Size = V(0.8, radius * 2, radius * 2), Transparency = 1}):Play()
+	Debris:AddItem(p, (secs or 0.8) + 0.2)
+end
+local function flash(pos, size, color)
+	local p = Instance.new("Part")
+	p.Anchored, p.CanCollide, p.CanQuery, p.CanTouch = true, false, false, false
+	p.Shape = Enum.PartType.Ball
+	p.Material = Enum.Material.Neon
+	p.Color = color or COL.LIGHT
+	p.Size = V(size * 0.4, size * 0.4, size * 0.4)
+	p.CFrame = CFrame.new(pos)
+	p.Parent = workspace
+	TweenService:Create(p, TweenInfo.new(0.3), {Size = V(size, size, size), Transparency = 1}):Play()
+	Debris:AddItem(p, 0.4)
+end
+local function dust(pos, n, size, color)
+	local p = Instance.new("Part")
+	p.Anchored, p.CanCollide, p.CanQuery, p.CanTouch, p.Transparency = true, false, false, false, 1
+	p.Size = V(1, 1, 1)
+	p.CFrame = CFrame.new(pos)
+	local e = Instance.new("ParticleEmitter")
+	e.Rate = 0
+	e.Lifetime = NumberRange.new(0.9, 1.8)
+	e.Speed = NumberRange.new(8, 26)
+	e.SpreadAngle = Vector2.new(75, 75)
+	e.EmissionDirection = Enum.NormalId.Top
+	e.Color = ColorSequence.new(color or COL.LIGHT)
+	e.LightEmission = 0.6
+	e.Size = NumberSequence.new({NumberSequenceKeypoint.new(0, size * 0.5), NumberSequenceKeypoint.new(1, size)})
+	e.Transparency = NumberSequence.new({NumberSequenceKeypoint.new(0, 0.3), NumberSequenceKeypoint.new(1, 1)})
+	e.Acceleration = V(0, -3, 0)
+	e.Parent = p
+	p.Parent = workspace
+	e:Emit(n)
+	Debris:AddItem(p, 3)
+end
+local function streak(a, b, color, w)
+	local d = b - a
+	if d.Magnitude < 0.5 then return end
+	local p = Instance.new("Part")
+	p.Anchored, p.CanCollide, p.CanQuery, p.CanTouch = true, false, false, false
+	p.Material = Enum.Material.Neon
+	p.Color = color or COL.LIGHT
+	p.Size = V(w or 0.8, w or 0.8, d.Magnitude)
+	p.CFrame = CFrame.lookAt((a + b) / 2, b)
+	p.Parent = workspace
+	TweenService:Create(p, TweenInfo.new(0.4), {Transparency = 1, Size = V(0.05, 0.05, d.Magnitude)}):Play()
+	Debris:AddItem(p, 0.5)
+end
+-- darker, stormy sky (cutscene)
+local function skyDim(on)
+	if not on then
+		if S.cc then pcall(function() S.cc:Destroy() end); S.cc = nil end
+		if S.amb then
+			pcall(function() Lighting.Brightness = S.amb.B; Lighting.ExposureCompensation = S.amb.E end)
+			S.amb = nil
+		end
+		return
+	end
+	if S.cc then return end
+	pcall(function() S.amb = {B = Lighting.Brightness, E = Lighting.ExposureCompensation} end)
+	pcall(function()
+		Lighting.Brightness = math.max(0.4, (S.amb and S.amb.B or 2) * 0.5)
+		Lighting.ExposureCompensation = (S.amb and S.amb.E or 0) - 0.5
+	end)
+	pcall(function()
+		local cc = Instance.new("ColorCorrectionEffect")
+		cc.Name = "MichaelColor"
+		cc.Saturation, cc.Contrast, cc.TintColor = -0.25, 0.1, Color3.fromRGB(205, 215, 240)
+		cc.Parent = Lighting
+		S.cc = cc
+	end)
+end
+
+-- EFFECT BRICKS (parked underground, borrowed by the skills) -----------------------------------------------------------------------------------------------
+local function fxTake(tp, n, color, neon)
+	local out = {}
+	local free = S.fxFree[tp]
+	if not free then return out end
+	for _ = 1, n do
+		local s = table.remove(free)
+		if not s then break end
+		s.use = nil
+		pcall(function()
+			s.p.Color = color or COL.LIGHT
+			s.p.Material = neon and Enum.Material.Neon or Enum.Material.SmoothPlastic
+			s.p.Transparency = 0
+		end)
+		out[#out + 1] = s
+	end
+	return out
+end
+local function fxGive(list)
+	for _, s in ipairs(list) do
+		s.use = nil
+		local free = S.fxFree[s.tp]
+		if free then free[#free + 1] = s end
+	end
+end
+local function scatter(list, center, power, secs) -- bricks burst apart with gravity, then return
+	local vel = {}
+	for i, s in ipairs(list) do
+		local p = s.use and s.use.Position or center
+		local d = p - center
+		d = (d.Magnitude > 0.1) and d.Unit or V(0, 1, 0)
+		vel[i] = d * power * (0.5 + math.random() * 0.8) + V(0, power * 0.6, 0)
+	end
+	task.spawn(function()
+		local t0 = os.clock()
+		while os.clock() - t0 < secs do
+			local dt = RunService.Heartbeat:Wait()
+			for i, s in ipairs(list) do
+				vel[i] = vel[i] + V(0, -45 * dt, 0)
+				if s.use then
+					s.use = s.use * CFrame.Angles(dt * 3, dt * 2, 0)
+					s.use = s.use + vel[i] * dt
+					pcall(function() s.p.Transparency = clamp((os.clock() - t0) / secs, 0, 1) end)
+				end
+			end
+		end
+		fxGive(list)
+	end)
+end
+local function ringBricks(center, r0, r1, n, tp, secs, color) -- ring of bricks racing outward along the ground
+	local list = fxTake(tp, n, color or COL.GOLD, true)
+	n = #list
+	if n == 0 then return end
+	task.spawn(function()
+		local t0 = os.clock()
+		while true do
+			local k = (os.clock() - t0) / secs
+			if k >= 1 then break end
+			local r = mix(r0, r1, smooth(k))
+			for i, s in ipairs(list) do
+				local a = i / n * TAU
+				local dir = V(math.cos(a), 0, math.sin(a))
+				s.use = yAxisCF(center + dir * r + V(0, 2, 0), dir, V(0, 1, 0))
+				pcall(function() s.p.Transparency = clamp(k * 1.3 - 0.3, 0, 1) end)
+			end
+			RunService.Heartbeat:Wait()
+		end
+		fxGive(list)
+	end)
+end
+local function feathers(center, n, secs) -- drifting light feathers
+	local list = fxTake("K", n, COL.WHITE, true)
+	local r = fxTake("R", math.floor(n / 2), COL.LIGHT, true)
+	for _, s in ipairs(r) do list[#list + 1] = s end
+	local vel = {}
+	for i, s in ipairs(list) do
+		s.use = CFrame.new(center + V((math.random() - 0.5) * 10, math.random() * 4, (math.random() - 0.5) * 10))
+		vel[i] = V((math.random() - 0.5) * 14, 10 + math.random() * 16, (math.random() - 0.5) * 14)
+	end
+	task.spawn(function()
+		local t0 = os.clock()
+		while os.clock() - t0 < secs do
+			local dt = RunService.Heartbeat:Wait()
+			local k = (os.clock() - t0) / secs
+			for i, s in ipairs(list) do
+				vel[i] = vel[i] + V(math.sin(os.clock() * 2 + i) * 6 * dt, -9 * dt, math.cos(os.clock() * 2 + i) * 6 * dt)
+				if s.use then
+					s.use = s.use * CFrame.Angles(dt * 2, dt * 3, dt) + vel[i] * dt
+					pcall(function() s.p.Transparency = clamp(k * 1.2 - 0.2, 0, 1) end)
+				end
+			end
+		end
+		fxGive(list)
+	end)
+end
+-- a chain of 2x2x4 bricks between two points (re-aimed every frame), plus swirling sparks
+local function beamFx(getFrom, getTo, secs, color, maxD, thick)
+	local list = fxTake("D", maxD or 16, color or COL.LIGHT, true)
+	local sheath = thick and fxTake("T", 10, COL.GOLD, true) or {}
+	local sparks = fxTake("C", 8, COL.WHITE, true)
+	if #list == 0 then return end
+	task.spawn(function()
+		local t0 = os.clock()
+		while os.clock() - t0 < secs do
+			local el = os.clock() - t0
+			local a, b = getFrom(), getTo()
+			local d = b - a
+			local len = d.Magnitude
+			if len > 1 then
+				local dir = d.Unit
+				local ref = (math.abs(dir.Y) > 0.9) and V(1, 0, 0) or V(0, 1, 0)
+				local u = dir:Cross(ref).Unit
+				local v = dir:Cross(u).Unit
+				local grow = smooth(el / 0.12)
+				local fade = clamp((secs - el) / 0.3, 0, 1)
+				for i, s in ipairs(list) do
+					local off = 2 + (i - 1) * 4
+					if off - 2 < len * grow then
+						s.use = yAxisCF(a + dir * off, dir, ref)
+						pcall(function() s.p.Transparency = 1 - fade end)
+					else
+						s.use = nil
+					end
+				end
+				for i, s in ipairs(sheath) do
+					local off = 2 + (i - 1) * 6
+					local ang = el * 8 + i * 1.3
+					if off - 2 < len * grow then
+						s.use = yAxisCF(a + dir * off + (u * math.cos(ang) + v * math.sin(ang)) * 4.2, dir, u * math.cos(ang) + v * math.sin(ang))
+						pcall(function() s.p.Transparency = 0.2 + (1 - fade) * 0.8 end)
+					else
+						s.use = nil
+					end
+				end
+				for i, s in ipairs(sparks) do
+					local f = (i / #sparks + el * 1.7) % 1
+					local ang = i * 1.3 + el * 20
+					s.use = CFrame.new(a + dir * (f * len * grow) + (u * math.cos(ang) + v * math.sin(ang)) * 3)
+					pcall(function() s.p.Transparency = 1 - fade end)
+				end
+			end
+			RunService.Heartbeat:Wait()
+		end
+		fxGive(list)
+		fxGive(sheath)
+		fxGive(sparks)
+	end)
+end
+-- crescent of light (thin 1x4x4 panels) flying forward
+local function crescent(origin, dir, side, secs, radius)
+	local list = fxTake("T", 10, COL.LIGHT, true)
+	local n = #list
+	if n == 0 then return end
+	task.spawn(function()
+		local t0 = os.clock()
+		while os.clock() - t0 < secs do
+			local k = (os.clock() - t0) / secs
+			local c = origin + dir * (k * 80)
+			for i, s in ipairs(list) do
+				local th = (i / (n + 1) - 0.5) * 2.6
+				local radial = dir * math.cos(th) + side * math.sin(th)
+				local tangent = -dir * math.sin(th) + side * math.cos(th)
+				s.use = yAxisCF(c + radial * (radius or 13) * (1 - k * 0.25), tangent, V(0, 1, 0))
+				pcall(function() s.p.Transparency = clamp(k * 1.25 - 0.25, 0, 1) end)
+			end
+			RunService.Heartbeat:Wait()
+		end
+		fxGive(list)
+	end)
+end
+
+-- aiming ------------------------------------------------------------------------------------------------------------------------------------------------------
+local function targetHrp(pl)
+	local c = pl and pl.Character
+	return c and c:FindFirstChild("HumanoidRootPart")
+end
+local function findPlayer(txt)
+	txt = string.lower(txt or ""):match("^%s*(.-)%s*$")
+	if txt == "" then return nil end
+	local partial
+	for _, pl in ipairs(Players:GetPlayers()) do
+		if pl ~= lp then
+			local n, d = pl.Name:lower(), pl.DisplayName:lower()
+			if n == txt or d == txt then return pl end
+			if not partial and (n:sub(1, #txt) == txt or d:sub(1, #txt) == txt) then partial = pl end
+		end
+	end
+	return partial
+end
+local function nearestOther()
+	local best, bd
+	for _, pl in ipairs(Players:GetPlayers()) do
+		if pl ~= lp then
+			local th = targetHrp(pl)
+			if th then
+				local d = (th.Position - hrp.Position).Magnitude
+				if d < 150 and (not bd or d < bd) then best, bd = pl, d end
+			end
+		end
+	end
+	return best
+end
+local function F3(h) return V(-math.sin(h), 0, -math.cos(h)) end
+local function flatDir(v)
+	local f = V(v.X, 0, v.Z)
+	return (f.Magnitude > 0.01) and f.Unit or V(0, 0, -1)
+end
+local function aimPoint()
+	local th = targetHrp(S.targetPl or nearestOther())
+	if th then return th.Position end
+	return V(S.pos.X, S.gy, S.pos.Z) + F3(S.hd) * 50
+end
+local function headingTo(from, to)
+	local d = V(to.X - from.X, 0, to.Z - from.Z)
+	if d.Magnitude < 0.01 then return S.hd end
+	return math.atan2(-d.X, -d.Z)
+end
+local function poseSet(t, rate)
+	for k in pairs(S.poseT) do S.poseT[k] = t[k] or 0 end
+	S.poseRate = rate or 7
+end
+local function wt(x) task.wait(x) end
+local function glide(dest, h, secs) -- move Michael (position + flight height) smoothly
+	local p0, h0 = S.pos, S.h
+	local t0 = os.clock()
+	while true do
+		local k = (os.clock() - t0) / secs
+		if k >= 1 or S.skip then break end
+		local e = smooth(k)
+		S.pos = V(mix(p0.X, dest.X, e), 0, mix(p0.Z, dest.Z, e))
+		S.h = mix(h0, h, e)
+		RunService.Heartbeat:Wait()
+	end
+	S.pos = V(dest.X, 0, dest.Z)
+	S.h = h
+end
+local function swordTipPos() return S.swTip end
+
+-- SKILLS ---------------------------------------------------------------------------------------------------------------------------------------------------------
+local skills = {}
+local UP = V(0, 1, 0)
+local IDLE_POSE = {armR = 0.1, foreR = 0.9}
+
+function skills.Slash()
+	shout("DIVINE SLASH")
+	local a = aimPoint()
+	S.faceH = headingTo(S.pos, a)
+	local dir = F3(headingTo(S.pos, a))
+	local side = V(-dir.Z, 0, dir.X)
+	poseSet({armR = 1.7, foreR = 1.0, twist = -0.6, lean = 0.12, armL = 0.3}, 8) -- raise the sword behind
+	wt(0.45)
+	sfx("slash")
+	poseSet({armR = 0.4, foreR = -1.0, twist = 0.8, lean = -0.35, armL = 0.3}, 30) -- cut
+	S.dash = {spd = 22, t = 0.2}
+	wt(0.1)
+	local o = V(S.pos.X, S.gy + S.h + 9, S.pos.Z)
+	crescent(o + dir * 3, dir, side, 0.9, 14)
+	flash(swordTipPos(), 12, COL.LIGHT)
+	for i = 1, 4 do ring(V(S.pos.X, S.gy, S.pos.Z) + dir * (i * 14), 6 + i * 3, COL.GOLD, 0.5) end
+	shakeFrom(o, 0.8, 0.3, 300)
+	wt(0.5)
+	poseSet(IDLE_POSE, 5)
+	S.faceH = nil
+end
+
+function skills.Beam()
+	shout("SWORD BEAM")
+	local a = aimPoint()
+	S.faceH = headingTo(S.pos, a)
+	poseSet({armR = 1.2, foreR = -1.2, lean = -0.05, armL = 0.4}, 7) -- sword out in front
+	wt(0.6)
+	sfx("beam", 1, 0.9)
+	local charge = fxTake("M", 6, COL.WHITE, true)
+	local t0 = os.clock()
+	while os.clock() - t0 < 0.8 do -- light gathers in the blade
+		local k = (os.clock() - t0) / 0.8
+		local tip = swordTipPos()
+		for i, s in ipairs(charge) do
+			local ang = i / #charge * TAU + k * 12
+			s.use = CFrame.new(tip + V(math.cos(ang), math.sin(ang * 1.4), math.sin(ang)) * (8 * (1 - k) + 1.5)) * CFrame.Angles(k * 7, k * 5, 0)
+		end
+		RunService.Heartbeat:Wait()
+	end
+	fxGive(charge)
+	flash(swordTipPos(), 14, COL.WHITE)
+	flashScreen(0.3, COL.LIGHT)
+	sfx("boom", 0.8)
+	local tgt = V(a.X, a.Y + 2, a.Z)
+	local dur = 1.4
+	beamFx(function() return swordTipPos() end, function() return tgt end, dur, COL.LIGHT, 16, true)
+	local t1 = os.clock()
+	while os.clock() - t1 < dur do
+		ring(V(a.X, S.gy, a.Z), 8 + (os.clock() - t1) * 12, COL.GOLD, 0.4)
+		shakeFrom(a, 0.6, 0.15, 400)
+		task.wait(0.18)
+	end
+	flash(tgt, 22, COL.LIGHT)
+	ringBricks(V(a.X, S.gy, a.Z), 3, 26, 8, "M", 0.7, COL.GOLD)
+	shakeFrom(a, 1.4, 0.5, 500)
+	wt(0.4)
+	poseSet(IDLE_POSE, 5)
+	S.faceH = nil
+end
+
+function skills.Teleport() -- teleport behind people
+	shout("TELEPORT")
+	local th = targetHrp(S.targetPl or nearestOther())
+	local dest, face
+	if th then
+		local l = flatDir(th.CFrame.LookVector)
+		dest = V(th.Position.X, 0, th.Position.Z) - l * 8
+		face = th.Position
+	else
+		local l = F3(S.hd)
+		dest = V(S.pos.X, 0, S.pos.Z) + l * 40
+		face = dest + l * 20
+	end
+	local from = V(S.pos.X, S.gy + S.h + 8, S.pos.Z)
+	sfx("tp")
+	flash(from, 16, COL.LIGHT)
+	feathers(from, 10, 1.4)
+	ring(V(S.pos.X, S.gy, S.pos.Z), 14, COL.GOLD, 0.6)
+	local ng = groundAt(V(dest.X, hrp.Position.Y + 20, dest.Z), 60)
+	local to = V(dest.X, ng + S.h + 8, dest.Z)
+	streak(from, to, COL.LIGHT, 1.6)
+	S.pos = V(dest.X, 0, dest.Z)
+	S.gy = ng
+	S.hd = headingTo(S.pos, face)
+	flash(to, 16, COL.LIGHT)
+	feathers(to, 10, 1.4)
+	ring(V(dest.X, ng, dest.Z), 14, COL.GOLD, 0.6)
+	shakeFrom(to, 0.8, 0.25, 300)
+	S.hold = os.clock() + 4
+	wt(0.5)
+end
+
+function skills.FlySlash()
+	if not S.flying or S.h < 6 then notify("Fly first (Fly button) to use the flying slash", 3) return end
+	shout("FLYING SLASH")
+	local a = aimPoint()
+	local dir = F3(headingTo(S.pos, a))
+	local side = V(-dir.Z, 0, dir.X)
+	S.faceH = headingTo(S.pos, a)
+	poseSet({armR = 1.7, foreR = 1.0, twist = -0.6, dive = 0.2, armL = 0.3}, 8)
+	local back = V(S.pos.X, 0, S.pos.Z) - dir * 12
+	glide(back, S.h + 6, 0.45)
+	poseSet({armR = 0.4, foreR = -1.0, twist = 0.8, dive = 0.9, armL = 0.3}, 28)
+	sfx("slash", 1, 0.8)
+	local start = S.pos
+	local path = V(a.X, 0, a.Z) + dir * 26
+	local t0 = os.clock()
+	local dur = 0.38
+	local spawned = false
+	while true do
+		local k = (os.clock() - t0) / dur
+		if k >= 1 then break end
+		local e = k * k * (3 - 2 * k)
+		S.pos = V(mix(start.X, path.X, e), 0, mix(start.Z, path.Z, e))
+		S.h = mix(S.h, math.max(10, a.Y - S.gy + 6), 0.08)
+		if not spawned and k > 0.45 then
+			spawned = true
+			local o = V(S.pos.X, S.gy + S.h + 6, S.pos.Z)
+			crescent(o, dir, side, 0.9, 15)
+			flash(swordTipPos(), 16, COL.LIGHT)
+			flashScreen(0.2, COL.LIGHT)
+			shakeFrom(o, 0.8, 0.3, 400)
+		end
+		if math.random() < 0.5 then
+			local f = fxTake("R", 1, COL.LIGHT, true)
+			if f[1] then
+				f[1].use = yAxisCF(V(S.pos.X, S.gy + S.h + 6, S.pos.Z), -dir, UP)
+				scatter(f, V(S.pos.X, S.gy + S.h + 6, S.pos.Z), 8, 0.6)
+			end
+		end
+		RunService.Heartbeat:Wait()
+	end
+	ring(V(a.X, S.gy, a.Z), 20, COL.GOLD, 0.7)
+	wt(0.3)
+	poseSet(IDLE_POSE, 5)
+	S.faceH = nil
+	S.hold = os.clock() + 4
+end
+
+function skills.FlyBeam()
+	if not S.flying then notify("Fly first (Fly button) to use the flying beam", 3) return end
+	shout("HEAVENLY BEAM")
+	local a = aimPoint()
+	S.faceH = headingTo(S.pos, a)
+	local hStart = S.h
+	poseSet({armR = 1.2, foreR = -2.0, lean = -0.05, armL = 0.5, flap = 0.3}, 6)
+	glide(V(S.pos.X, 0, S.pos.Z), math.max(S.h, 48), 0.9) -- rise
+	flashScreen(0.15, COL.LIGHT)
+	sfx("beam", 1.1, 0.7)
+	local tgt = V(a.X, a.Y, a.Z)
+	local charge = fxTake("M", 8, COL.WHITE, true)
+	local t0 = os.clock()
+	while os.clock() - t0 < 1.0 do
+		local k = (os.clock() - t0) / 1.0
+		local tip = swordTipPos()
+		for i, s in ipairs(charge) do
+			local ang = i / #charge * TAU + k * 14
+			s.use = CFrame.new(tip + V(math.cos(ang), math.sin(ang * 1.2), math.sin(ang)) * (10 * (1 - k) + 2)) * CFrame.Angles(k * 9, k * 6, 0)
+		end
+		RunService.Heartbeat:Wait()
+	end
+	fxGive(charge)
+	flash(swordTipPos(), 18, COL.WHITE)
+	flashScreen(0.4, COL.LIGHT)
+	sfx("boom")
+	local dur = 1.8
+	beamFx(function() return swordTipPos() end, function() return tgt end, dur, COL.LIGHT, 16, true)
+	local t1 = os.clock()
+	while os.clock() - t1 < dur do
+		ring(V(a.X, S.gy, a.Z), 10 + (os.clock() - t1) * 14, COL.GOLD, 0.45)
+		shakeFrom(a, 0.8, 0.2, 500)
+		task.wait(0.15)
+	end
+	flash(tgt + V(0, 3, 0), 30, COL.LIGHT)
+	ringBricks(V(a.X, S.gy, a.Z), 3, 34, 8, "M", 0.8, COL.GOLD)
+	ringBricks(V(a.X, S.gy, a.Z), 3, 26, 8, "L", 0.8, COL.LIGHT)
+	flashScreen(0.4, COL.LIGHT)
+	shakeFrom(a, 1.8, 0.7, 600)
+	wt(0.5)
+	glide(V(S.pos.X, 0, S.pos.Z), hStart, 0.8)
+	poseSet(IDLE_POSE, 5)
+	S.faceH = nil
+end
+
+local SKILL_LIST = {{"Slash", "Slash"}, {"Sword Beam", "Beam"}, {"Teleport Behind", "Teleport"}, {"Fly Slash", "FlySlash"}, {"Fly Beam", "FlyBeam"}}
+local function runSkill(name)
+	if not S.alive then notify("Summon Michael first", 2) return end
+	if S.cut or S.busy or S.dismissing then return end
+	if S.act then notify("Busy: " .. S.act, 2) return end
+	if S.kneel then notify("Michael is kneeling - press Kneel again to stand up first", 3) return end
+	if not skills[name] then return end
+	S.act = name
+	S.hold = nil
+	local ok, err = pcall(skills[name])
+	if not ok then warn("[ArchangelMichael] " .. tostring(err)) end
+	poseSet(IDLE_POSE, 5)
+	S.faceH, S.dash = nil, nil
+	S.act = nil
+end
+
+-- cutscene engine ---------------------------------------------------------------------------------------------------------------------------------------------------
+local function cineShow()
+	CN.winWas = CN.win and CN.win.Visible or false
+	if CN.win then CN.win.Visible = false end
+	if CN.open then CN.open.Visible = false end
+	CN.barTop.Visible, CN.barBot.Visible, CN.skipBtn.Visible = true, true, true
+	local ti = TweenInfo.new(0.9, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+	TweenService:Create(CN.barTop, ti, {Size = UDim2.new(1, 0, 0.12, 0)}):Play()
+	TweenService:Create(CN.barBot, ti, {Size = UDim2.new(1, 0, 0.12, 0)}):Play()
+end
+local function cineHide()
+	fadeText(CN.title, 1, 0.4)
+	fadeText(CN.sub, 1, 0.4)
+	CN.speech.Text = ""
+	CN.fade.Visible = false
+	CN.skipBtn.Visible = false
+	local ti = TweenInfo.new(0.6, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+	TweenService:Create(CN.barTop, ti, {Size = UDim2.new(1, 0, 0, 0)}):Play()
+	TweenService:Create(CN.barBot, ti, {Size = UDim2.new(1, 0, 0, 0)}):Play()
+	if CN.win then CN.win.Visible = CN.winWas ~= false end
+	if CN.open then CN.open.Visible = true end
+	task.delay(0.8, function()
+		if not S.cut then
+			CN.barTop.Visible, CN.barBot.Visible, CN.title.Visible, CN.sub.Visible = false, false, false, false
+		end
+	end)
+end
+local function startCine(camFn)
+	S.cut, S.skip, S.busy = true, false, true
+	S.camT0, S.camFn = os.clock(), camFn
+	pcall(function() S.walk = hum.WalkSpeed; hum.WalkSpeed = 0 end)
+	cam.CameraType = Enum.CameraType.Scriptable
+	cineShow()
+	local baseFov = cam.FieldOfView
+	task.spawn(function()
+		while S.cut do
+			local dt = RunService.RenderStepped:Wait()
+			S.flare = math.max(0, S.flare - dt * 2)
+			local ok, pos, target, fov = pcall(S.camFn, os.clock() - S.camT0)
+			if ok and pos then
+				local jit = V(math.random() - 0.5, math.random() - 0.5, math.random() - 0.5) * (S.flare * 5)
+				cam.CFrame = CFrame.lookAt(pos + jit, target)
+				cam.FieldOfView = fov or 60
+			end
+		end
+		cam.CameraType = Enum.CameraType.Custom
+		cam.FieldOfView = baseFov
+	end)
+end
+local function endCine()
+	S.cut, S.busy, S.camFn, S.skip = false, false, nil, false
+	if S.walk then pcall(function() hum.WalkSpeed = S.walk end); S.walk = nil end
+	cineHide()
+end
+local function W(sec) -- abortable wait
+	local t0 = os.clock()
+	while os.clock() - t0 < sec do
+		if S.skip or not S.alive then return true end
+		RunService.Heartbeat:Wait()
+	end
+	return S.skip or not S.alive
+end
+local function typewrite(text, secs) -- subtitle, one letter at a time. returns true if skipped
+	local n = #text
+	for i = 1, n do
+		if S.skip or not S.alive then return true end
+		CN.speech.Text = text:sub(1, i)
+		sfx("holy", 0.25, 1 + (i % 3) * 0.1)
+		task.wait(secs / n)
+	end
+	return false
+end
+
+-- per-frame step ---------------------------------------------------------------------------------------------------------------------------------------------------
+local function getMove()
+	local x, z = 0, 0
+	if not UIS:GetFocusedTextBox() then
+		if UIS:IsKeyDown(Enum.KeyCode.W) then z -= 1 end
+		if UIS:IsKeyDown(Enum.KeyCode.S) then z += 1 end
+		if UIS:IsKeyDown(Enum.KeyCode.A) then x -= 1 end
+		if UIS:IsKeyDown(Enum.KeyCode.D) then x += 1 end
+	end
+	local pad = S.pad
+	if pad.f then z -= 1 end
+	if pad.b then z += 1 end
+	if pad.l then x -= 1 end
+	if pad.r then x += 1 end
+	local v = V(x, 0, z)
+	if v.Magnitude < 0.05 then return V() end
+	if v.Magnitude > 1 then v = v.Unit end
+	local w = cam.CFrame:VectorToWorldSpace(v)
+	w = V(w.X, 0, w.Z)
+	if w.Magnitude < 0.01 then return V() end
+	return w.Unit * v.Magnitude
+end
+
+local function step(dt)
+	local t = os.clock()
+	local pose = S.pose
+	local P = hrp.CFrame
+
+	-- movement: control (pad / WASD) or follow the owner
+	local wantDir, tgtSp = nil, 0
+	if not (S.act or S.cut or S.busy or S.kneel) then
+		local top = S.flying and CFG.FLY or CFG.WALK
+		if S.control then
+			local mv = getMove()
+			if mv.Magnitude > 0.1 then wantDir, tgtSp = mv.Unit, top * math.min(1, mv.Magnitude + 0.15) end
+			if S.flying then
+				local up = S.pad.u or (not UIS:GetFocusedTextBox() and UIS:IsKeyDown(Enum.KeyCode.Space))
+				local dn = S.pad.d or (not UIS:GetFocusedTextBox() and UIS:IsKeyDown(Enum.KeyCode.LeftShift))
+				if up or dn then S.flyTarget = clamp(S.flyTarget + ((up and 1 or 0) - (dn and 1 or 0)) * 30 * dt, 6, 140) end
+			end
+		else
+			local owner = P.Position
+			local fp = (P * CFrame.new(-9, 0, 9)).Position
+			local flat = V(fp.X - S.pos.X, 0, fp.Z - S.pos.Z)
+			local dist = flat.Magnitude
+			if dist > 150 then
+				S.pos = V(fp.X, 0, fp.Z)
+			elseif dist > 14 then
+				wantDir, tgtSp = flat.Unit, top * clamp((dist - 12) / 20, 0.25, 1)
+			end
+			local toOwner = V(owner.X - S.pos.X, 0, owner.Z - S.pos.Z)
+			if not wantDir and toOwner.Magnitude > 1 then
+				S.hd += clamp(adiff(math.atan2(-toOwner.X, -toOwner.Z), S.hd) * math.min(1, dt * 2), -2 * dt, 2 * dt)
+			end
+		end
+	end
+	if S.faceH then
+		S.hd += clamp(adiff(S.faceH, S.hd) * math.min(1, dt * 6), -5 * dt, 5 * dt)
+	elseif wantDir then
+		local d = adiff(math.atan2(-wantDir.X, -wantDir.Z), S.hd)
+		S.hd += clamp(d * math.min(1, dt * 4), -3 * dt, 3 * dt)
+	end
+	local F = F3(S.hd)
+	S.curSp += (tgtSp - S.curSp) * math.min(1, dt * ((tgtSp > S.curSp) and 2.2 or 4))
+	local prev = S.pos
+	if S.curSp > 0.2 then S.pos = S.pos + F * S.curSp * dt end
+	if S.dash then
+		S.dash.t -= dt
+		S.pos = S.pos + F * S.dash.spd * dt
+		if S.dash.t <= 0 then S.dash = nil end
+	end
+	if S.hold and not S.act and os.clock() > S.hold then S.hold = nil end
+	local newGy = groundAt(V(S.pos.X, P.Position.Y + 30, S.pos.Z), 40)
+	if math.abs(newGy - S.gy) > 14 then S.gy = newGy else S.gy += (newGy - S.gy) * clamp(dt * 8, 0, 1) end
+	if not (S.act or S.cut) then
+		local targetH = S.flying and S.flyTarget or 0
+		S.h += (targetH - S.h) * clamp(dt * 2.4, 0, 1)
+		if not S.flying and S.h < 0.05 then S.h = 0 end
+	end
+	local rawV = (S.pos - prev) / math.max(dt, 1e-3)
+	if rawV.Magnitude > 220 then rawV = V() end
+	S.vel = S.vel:Lerp(rawV, clamp(dt * 8, 0, 1))
+	local sp = S.vel.Magnitude
+
+	-- pose blending
+	local kp = clamp(dt * S.poseRate, 0, 1)
+	for key, v in pairs(pose) do pose[key] = v + (S.poseT[key] - v) * kp end
+	S.kneelK += (((S.kneel and 1) or 0) - S.kneelK) * clamp(dt * 2.6, 0, 1)
+	S.swPlant += (((S.kneel and 1) or 0) - S.swPlant) * clamp(dt * 2.2, 0, 1)
+	local kn = S.kneelK
+	local flyF = smooth(clamp(S.h / 6, 0, 1))
+	local gt = S.gt
+	gt.gait += (clamp((sp - 1) / 5, 0, 1) - gt.gait) * clamp(dt * 6, 0, 1)
+	gt.ph += dt * clamp(sp * 0.07, 0, 2.2)
+	local ph = gt.ph % 1
+	local sph, cph = math.sin(2 * math.pi * ph), math.cos(2 * math.pi * ph)
+	local walkF = gt.gait * (1 - flyF) * (1 - kn)
+
+	-- skeleton
+	local breathe = math.sin(t * 1.5) * 0.012
+	local legSw = sph * 0.6 * walkF
+	local thL = mix(mix(legSw, -0.5, flyF), 0.05, kn)
+	local thR = mix(mix(-legSw, -0.5, flyF), 0.05, kn)
+	local shL = mix(mix(math.max(0, -legSw) * 0.5, -0.35, flyF), -1.5, kn)
+	local shR = mix(mix(math.max(0, legSw) * 0.5, -0.35, flyF), -1.5, kn)
+	local speedLean = clamp(sp / CFG.FLY, 0, 1) * 0.7
+	local rootPitch = -(flyF * (0.35 + speedLean) + pose.dive) + breathe
+	local lean = -0.05 - kn * 0.22 - walkF * 0.08 + pose.lean
+	local flapAmp = (0.1 + 0.55 * flyF) + pose.flap
+	local flap = math.sin(t * (2.2 + flyF * 6)) * flapAmp
+	local wingS = clamp(S.wingS * (1 - kn * 0.8) + flyF * 0.3, 0, 1)
+	local fold = 1 - wingS
+	local scan = (S.act or S.cut) and 0 or math.sin(t * 0.5) * 0.25
+	local rot = {
+		Root = CFrame.Angles(rootPitch, 0, sph * 0.02 * walkF),
+		Torso = CFrame.Angles(lean, pose.twist + cph * 0.08 * walkF, 0),
+		Head = CFrame.Angles(pose.head - kn * 0.6 + 0.05 - lean * 0.4, scan * (1 - kn), 0),
+		ArmL = CFrame.Angles(0.15 + pose.armL - cph * 0.5 * walkF + mix(0, 1.0, kn) - flyF * 0.5, 0, -(0.12 + pose.armLz + flyF * 0.1)),
+		ArmR = CFrame.Angles(0.15 + pose.armR + cph * 0.5 * walkF + mix(0, 0.9, kn) - flyF * 0.4, 0, 0.12 + pose.armRz + flyF * 0.1),
+		ForeL = CFrame.Angles(0.3 + pose.foreL + kn * 0.9, 0, 0),
+		ForeR = CFrame.Angles(0.3 + pose.foreR + kn * 0.9, 0, 0),
+		ThighL = CFrame.Angles(thL, 0, 0), ThighR = CFrame.Angles(thR, 0, 0),
+		ShinL = CFrame.Angles(shL, 0, 0), ShinR = CFrame.Angles(shR, 0, 0),
+		FootL = CFrame.Angles(-(thL + shL) * (1 - kn) + kn * 1.4, 0, 0), FootR = CFrame.Angles(-(thR + shR) * (1 - kn) + kn * 1.4, 0, 0),
+	}
+	for _, sd in ipairs({-1, 1}) do
+		local d = sd < 0 and "L" or "R"
+		rot["WingA" .. d] = CFrame.Angles(0, -sd * fold * 1.2, sd * flap)
+		rot["WingB" .. d] = CFrame.Angles(0, -sd * fold * 0.6, sd * (flap * 0.7 + 0.15 * fold))
+		rot["WingC" .. d] = CFrame.Angles(0, 0, sd * (flap * 0.5 + 0.1 * fold))
+	end
+	local Hh = mix(10, 4.05, kn) + math.sin(t * 1.4) * 0.05 * (1 - kn)
+	local bob = flyF * math.sin(t * 1.9) * 0.7
+	local baseCF = CFrame.new(S.pos.X, S.gy + (Hh - 10) + S.h + bob, S.pos.Z) * CFrame.Angles(0, S.hd, 0)
+	local M, world = {}, S.world
+	for _, name in ipairs(S.order) do
+		local b = S.bones[name]
+		if b.parent then
+			M[name] = M[b.parent] * CFrame.new(b.pv - S.bones[b.parent].pv) * rot[name]
+		else
+			M[name] = CFrame.new(b.pv) * rot[name]
+		end
+		world[name] = baseCF * M[name]
+	end
+
+	-- the sword: in the right hand, or planted in the ground in front of him (kneeling / cutscene)
+	local held = world.ForeR * CFrame.new(0, -5, 0) * CFrame.Angles(-HALF, 0, 0)
+	local plant = CFrame.new(S.pos.X, S.gy, S.pos.Z) * CFrame.Angles(0, S.hd, 0) * CFrame.new(0, 11, -5.5) * CFrame.Angles(math.pi, 0, 0)
+	local swCF = (S.swPlant > 0.001) and held:Lerp(plant, S.swPlant) or held
+	S.swCF = swCF
+	S.swTip = (swCF * CFrame.new(0, 23.5, 0)).Position
+
+	local park = V(S.pos.X, S.gy - 80, S.pos.Z)
+	for _, s in ipairs(S.slots) do
+		local cf
+		if s.kind == "fk" then
+			cf = S.bodyVis and (world[s.bone] * CFrame.new(s.off) * s.orient) or CFrame.new(park + V(s.fi * 0.5, 0, 0))
+		elseif s.kind == "sw" then
+			cf = S.bodyVis and (swCF * CFrame.new(s.off) * s.orient) or CFrame.new(park + V(s.fi * 0.5, 4, 0))
+		else
+			cf = s.use and (s.use * s.orient) or CFrame.new(park + V((s.fi % 16) * 5, 8, math.floor(s.fi / 16) * 5 + 8))
+		end
+		s.cf = cf
+	end
+	-- nothing may sink into the ground (only matters when he is near it)
+	if S.bodyVis and S.h < 3 then
+		local lowest = math.huge
+		for _, s in ipairs(S.body) do
+			local c = s.cf
+			local _, _, _, _, _, _, r10, r11, r12 = c:GetComponents()
+			local sz = s.p.Size
+			local low = c.Position.Y - 0.5 * (math.abs(r10) * sz.X + math.abs(r11) * sz.Y + math.abs(r12) * sz.Z)
+			if low < lowest then lowest = low end
+		end
+		if lowest < S.gy - 0.05 then
+			local shift = V(0, S.gy - lowest, 0)
+			for _, s in ipairs(S.body) do s.cf = s.cf + shift end
+			for k, w in pairs(world) do world[k] = w + shift end
+		end
+	end
+	S.headPos = (world.Head * CFrame.new(0, 2, 0)).Position
+	S.bodyPos = (world.Torso * CFrame.new(0, 4, 0)).Position
+	if S.camPart then S.camPart.Position = S.bodyPos + V(0, 4, 0) end
+
+	-- glow pulse on the gold parts
+	local pulse = 0.65 + 0.35 * math.sin(t * 3)
+	for _, s in ipairs(S.body) do
+		if s.tag == "glow" or s.tag == "halo" then
+			pcall(function()
+				s.p.Color = s.color:Lerp(COL.WHITE, 1 - pulse)
+				s.p.Material = Enum.Material.Neon
+			end)
+		end
+	end
+
+	S.lostT += dt
+	if S.lostT > 0.5 and isnetworkowner and not S.cut then
+		S.lostT = 0
+		local n = 0
+		for _, s in ipairs(S.body) do
+			local ok, own = pcall(isnetworkowner, s.p)
+			if ok and not own then n += 1 end
+		end
+		S.lostN = n
+		if n > 0 and os.clock() > S.noticeUntil then notify(n .. " bricks lost ownership - stay near Michael", 2) end
+	end
+end
+local function applyTargets()
+	for _, s in ipairs(S.slots) do
+		local p = s.p
+		if p.Parent and s.cf then
+			p.CFrame = s.cf
+			p.AssemblyLinearVelocity = V()
+			p.AssemblyAngularVelocity = V()
+		end
+	end
+end
+
+-- control / fly / kneel -------------------------------------------------------------------------------------------------------------------------------------------
+local zoomOld = {max = 128, min = 0.5}
+local function setControl(on)
+	if on == S.control then return end
+	S.control = on
+	if on then
+		S.targetPl = nil
+		if not S.camPart then
+			S.camPart = mk("Part", {Anchored = true, CanCollide = false, CanQuery = false, Transparency = 1, Size = V(1, 1, 1)}, workspace)
+			refreshFilters()
+		end
+		zoomOld.max, zoomOld.min = lp.CameraMaxZoomDistance, lp.CameraMinZoomDistance
+		lp.CameraMaxZoomDistance = 600
+		lp.CameraMinZoomDistance = 18
+		cam.CameraSubject = S.camPart
+	else
+		for k in pairs(S.pad) do S.pad[k] = false end
+		cam.CameraSubject = hum
+		lp.CameraMaxZoomDistance, lp.CameraMinZoomDistance = zoomOld.max, zoomOld.min
+	end
+end
+local function toggleKneel()
+	if not S.alive or S.cut or S.dismissing then notify("Summon Michael first", 3) return end
+	if S.act then notify("Wait for the current skill to finish", 3) return end
+	if S.flying then notify("Land first - turn Fly off", 3) return end
+	S.kneel = not S.kneel
+	if S.kneel then
+		poseSet({}, 5)
+		S.wingS = 0.25
+		notify("Michael kneels, the sword planted before him", 4)
+	else
+		S.wingS = 0.8
+		poseSet(IDLE_POSE, 5)
+		notify("Michael rises and takes up his sword", 4)
+	end
+end
+local function toggleFly()
+	if not S.alive or S.cut or S.dismissing then notify("Summon Michael first", 3) return end
+	if S.act then notify("Wait for the current skill to finish", 3) return end
+	if S.kneel then S.kneel = false; S.wingS = 0.8 end
+	S.flying = not S.flying
+	if S.flying then
+		S.wingS = 1
+		sfx("wing")
+		flash(V(S.pos.X, S.gy + 9, S.pos.Z), 14, COL.LIGHT)
+		feathers(V(S.pos.X, S.gy + 12, S.pos.Z), 8, 1.4)
+		notify("Flying. UP / DOWN (or Space / Shift in Control mode) change the height.", 5)
+	else
+		S.wingS = 0.8
+		notify("Landing", 3)
+	end
+end
+
+-- CUTSCENE: a beam of light made of bricks, Michael kneels in it, takes the sword, speaks -----------------------------------------------------------------------
+local function lightColumn(center, gyC)
+	local ls = fxTake("L", 16, COL.LIGHT, true)
+	local vs = fxTake("V", 10, COL.GOLD, true)
+	local ds = fxTake("D", 6, COL.WHITE, true)
+	local drop = 260
+	local ctl = {list = {}, t0 = os.clock()}
+	for i, s in ipairs(ls) do s.ty = gyC + 2 + (i - 1) * 4; s.tx, s.tz = center.X, center.Z; ctl.list[#ctl.list + 1] = s end
+	for i, s in ipairs(vs) do
+		local a = (i % 4) / 4 * TAU
+		s.ty = gyC + 6 + math.floor((i - 1) / 4) * 18
+		s.tx, s.tz = center.X + math.cos(a) * 6.5, center.Z + math.sin(a) * 6.5
+		s.ang = a
+		ctl.list[#ctl.list + 1] = s
+	end
+	for i, s in ipairs(ds) do
+		local a = i / #ds * TAU
+		s.ty = gyC + 10 + (i - 1) * 8
+		s.tx, s.tz = center.X + math.cos(a) * 4.2, center.Z + math.sin(a) * 4.2
+		s.ang = a
+		ctl.list[#ctl.list + 1] = s
+	end
+	task.spawn(function()
+		while not ctl.stop do
+			RunService.Heartbeat:Wait()
+			local el = os.clock() - ctl.t0
+			local k = smooth(el / 0.5)
+			for _, s in ipairs(ctl.list) do
+				local y = s.ty + (1 - k) * drop
+				local pos = V(s.tx, y, s.tz)
+				if s.ang then
+					s.use = yAxisCF(pos, UP, V(math.cos(s.ang), 0, math.sin(s.ang)))
+				else
+					s.use = CFrame.new(pos) * CFrame.Angles(0, el * 0.6, 0)
+				end
+				pcall(function() s.p.Transparency = ctl.fade or 0 end)
+			end
+		end
+		local all = {}
+		for _, s in ipairs(ctl.list) do all[#all + 1] = s end
+		scatter(all, center + V(0, 20, 0), 46, 1.2)
+	end)
+	-- the full-height shaft of light (local parts) so the beam reaches the sky
+	local shaft = {}
+	for i = 1, 3 do
+		local p = Instance.new("Part")
+		p.Anchored, p.CanCollide, p.CanQuery, p.CanTouch = true, false, false, false
+		p.Shape = Enum.PartType.Cylinder
+		p.Material = Enum.Material.Neon
+		p.Color = (i == 1) and COL.WHITE or COL.GOLD
+		p.Transparency = 0.2 + i * 0.2
+		p.Size = V(700, 8 + i * 5, 8 + i * 5)
+		p.CFrame = CFrame.new(center.X, gyC + 345, center.Z) * CFrame.Angles(0, 0, HALF)
+		p.Parent = workspace
+		shaft[i] = p
+	end
+	ctl.shaft = shaft
+	return ctl
+end
+
+local function runIntro(arena, hdFace)
+	local UNIT = 1
+	startCine(function(t)
+		local ctr = V(arena.X, S.gy, arena.Z)
+		local ahead = F3(S.hd)
+		local right = CFrame.Angles(0, S.hd, 0):VectorToWorldSpace(V(1, 0, 0))
+		if t < 2.0 then -- looking up at the darkening sky
+			local k = smooth(t / 2.0)
+			return ctr + ahead * 70 + right * 20 + V(0, 4, 0), ctr + V(0, mix(70, 90, k), 0), mix(60, 55, k)
+		elseif t < 5.6 then -- the beam hits; follow it down to the ground
+			local k = smooth((t - 2.0) / 3.6)
+			return ctr + ahead * mix(70, 46, k) + right * mix(20, -18, k) + V(0, mix(6, 22, k), 0), ctr + V(0, mix(60, 14, k), 0), mix(62, 50, k)
+		elseif t < 8.8 then -- Michael kneeling, slow orbit
+			local k = smooth((t - 5.6) / 3.2)
+			local a = mix(-0.7, 0.5, k)
+			return ctr + CFrame.Angles(0, S.hd, 0):VectorToWorldSpace(V(math.sin(a) * 30, mix(5, 10, k), -math.cos(a) * 30)), S.bodyPos - V(0, 2, 0), mix(55, 46, k)
+		elseif t < 11.4 then -- hands on the sword, then pulling it out
+			local k = smooth((t - 8.8) / 2.6)
+			return ctr + ahead * mix(26, 34, k) + right * mix(8, 14, k) + V(0, mix(5, 3, k), 0), ctr + V(0, mix(10, 14, k), 0), mix(48, 56, k)
+		elseif t < 17.8 then -- face close-up for the speech
+			local k = smooth((t - 11.4) / 6.4)
+			return S.headPos + ahead * mix(20, 12, k) + right * mix(6, -2, k) + V(0, mix(-3, 0, k), 0), S.headPos + V(0, 1, 0), mix(44, 32, k)
+		else -- pull back wide for the title
+			local k = smooth((t - 17.8) / 2.6)
+			return ctr + ahead * mix(26, 70, k) + right * mix(4, 18, k) + V(0, mix(8, 22, k), 0), S.bodyPos, mix(46, 62, k)
+		end
+	end)
+	task.spawn(function()
+		local col
+		local function seq()
+			TweenService:Create(CN.fade, TweenInfo.new(1.4), {BackgroundTransparency = 1}):Play()
+			skyDim(true)
+			sfx("holy", 0.7, 0.5)
+			if W(2.0) then return end
+			-- the beam of light made of bricks shoots down from the sky
+			col = lightColumn(arena, S.gy)
+			sfx("boom")
+			sfx("beam", 1.2, 0.6)
+			flashScreen(0.9, COL.LIGHT)
+			S.flare = 1
+			ring(V(arena.X, S.gy, arena.Z), 30, COL.GOLD, 1.0)
+			ring(V(arena.X, S.gy, arena.Z), 50, COL.WHITE, 1.4)
+			dust(V(arena.X, S.gy, arena.Z), 40, 14, COL.LIGHT)
+			if W(0.5) then return end
+			for i = 1, 5 do
+				ring(V(arena.X, S.gy, arena.Z), 12 + i * 6, COL.GOLD, 0.8)
+				shakeFrom(V(arena.X, S.gy, arena.Z), 1, 0.3, 600)
+				S.flare = 0.5
+				if W(0.6) then return end
+			end
+			-- the light opens: Michael is revealed, kneeling
+			col.stop = true
+			for _, p in ipairs(col.shaft) do
+				TweenService:Create(p, TweenInfo.new(1.4), {Transparency = 1}):Play()
+				Debris:AddItem(p, 1.6)
+			end
+			S.bodyVis = true
+			flashScreen(0.9, COL.WHITE)
+			sfx("holy", 1.2)
+			feathers(V(arena.X, S.gy + 8, arena.Z), 16, 3)
+			ring(V(arena.X, S.gy, arena.Z), 40, COL.WHITE, 1.2)
+			S.flare = 1
+			if W(0.6) then return end
+			-- wings unfold, head still bowed
+			local t0 = os.clock()
+			while os.clock() - t0 < 2.0 do
+				S.wingS = mix(0.25, 0.85, smooth((os.clock() - t0) / 2.0))
+				RunService.Heartbeat:Wait()
+				if S.skip then return end
+			end
+			sfx("wing")
+			if W(1.2) then return end
+			-- he lifts his head and grips the sword
+			poseSet({head = 0.7, armL = 0.2}, 2)
+			if W(1.0) then return end
+			sfx("holy", 1, 0.8)
+			poseSet({head = 0.3}, 3)
+			if W(0.6) then return end
+			-- pulls the sword out of the ground and rises
+			S.kneel = false
+			S.wingS = 0.9
+			local t2 = os.clock()
+			while os.clock() - t2 < 1.8 do
+				RunService.Heartbeat:Wait()
+				if S.skip then return end
+				if math.random() < 0.3 then dust(V(arena.X, S.gy, arena.Z) + F3(S.hd) * 5.5, 6, 8, COL.LIGHT) end
+			end
+			ring(V(arena.X, S.gy, arena.Z), 36, COL.GOLD, 1.0)
+			ring(V(arena.X, S.gy, arena.Z), 20, COL.WHITE, 0.7)
+			shakeFrom(V(arena.X, S.gy, arena.Z), 1.4, 0.6, 600)
+			flashScreen(0.4, COL.LIGHT)
+			sfx("boom", 0.8)
+			poseSet({armR = 1.1, foreR = 0.2, head = 0.25}, 4) -- the sword raised
+			feathers(V(arena.X, S.gy + 10, arena.Z), 12, 3)
+			if W(1.6) then return end
+			-- he speaks
+			for i, line in ipairs(CFG.SPEECH) do
+				CN.speech.Text = ""
+				if typewrite(line, math.max(0.9, #line * 0.11)) then return end
+				if W((i == #CFG.SPEECH) and 1.4 or 0.7) then return end
+			end
+			CN.speech.Text = ""
+			titleCard("ARCHANGEL MICHAEL", "ANGEL OF ALL ANGELS")
+			sfx("holy", 1.2, 0.7)
+			ring(V(arena.X, S.gy, arena.Z), 44, COL.GOLD, 1.2)
+			if W(3.0) then return end
+		end
+		seq()
+		-- final state (also when skipped)
+		if col then col.stop = true; for _, p in ipairs(col.shaft) do pcall(function() p:Destroy() end) end end
+		S.bodyVis = true
+		S.kneel = false
+		S.kneelK, S.swPlant = 0, 0
+		S.wingS = 0.8
+		S.flare = 0
+		CN.speech.Text = ""
+		skyDim(false)
+		poseSet(IDLE_POSE, 4)
+		for k in pairs(S.pose) do S.pose[k] = S.poseT[k] end
+		endCine()
+		if S.alive then notify("Michael has descended. Keys 1-7: Slash, Beam, Teleport, Kneel, Fly, Fly Slash, Fly Beam.", 7) end
+	end)
+end
+
+-- summon / dismiss -------------------------------------------------------------------------------------------------------------------------------------------------
+local function finishDismiss()
+	setControl(false)
+	for _, s in ipairs(S.saved or {}) do
+		local p = s.p
+		if p and p.Parent then
+			pcall(function()
+				local bf = p:FindFirstChild("MichaelAntiG")
+				if bf then bf:Destroy() end
+				p.CFrame = s.cf
+				p.Anchored = s.anchored
+				p.CanCollide = s.collide
+				p.Color, p.Material, p.Transparency = s.color, s.material, s.transparency
+				p.AssemblyLinearVelocity = V()
+			end)
+		end
+	end
+	if S.camPart then S.camPart:Destroy(); S.camPart = nil end
+	skyDim(false)
+	S.pool, S.slots, S.body, S.swSlots, S.saved, S.fxFree = {}, {}, {}, {}, {}, {}
+	S.alive, S.act, S.targetPl, S.dismissing, S.flying, S.kneel, S.h = false, nil, nil, false, false, false, 0
+end
+local function runDiagnosis()
+	local byType, other, unusable = scan()
+	if not byType then return nil, {tostring(other)} end
+	local ok, lines = diagnose(byType, other, unusable)
+	return ok, lines, byType
+end
+local CNinfo = {lbl = nil}
+local function summon()
+	if S.alive or S.dismissing then return end
+	local ok, lines, byType = runDiagnosis()
+	if ok == nil then notify("Cannot scan: " .. tostring(lines[1]), 8) return end
+	if CNinfo.lbl then CNinfo.lbl.Text = table.concat(lines, "\n") end
+	if not ok then
+		for _, l in ipairs(lines) do
+			if l:sub(1, 3) == "[X]" then notify("Cannot summon: " .. l, 9) break end
+		end
+		return
+	end
+	local notOwned = 0
+	local chosen = {}
+	for _, t in ipairs(TYPES) do
+		local list = byType[t.id]
+		chosen[t.id] = {}
+		for i = 1, NEED[t.id] do
+			chosen[t.id][i] = list[i][1]
+			if list[i][3] ~= 0 then notOwned += 1 end
+		end
+	end
+	if isnetworkowner and notOwned > 0 then
+		notify(string.format("%d of the bricks are not yours right now. Walk next to your bricks and summon again.", notOwned), 9)
+		return
+	end
+	local counter = {}
+	for _, t in ipairs(TYPES) do counter[t.id] = 0 end
+	local function nextBrick(tp)
+		counter[tp] += 1
+		return chosen[tp][counter[tp]]
+	end
+	local bones, order, cells = bodyCells()
+	S.bones, S.order = bones, order
+	S.slots, S.body, S.swSlots, S.saved, S.pool, S.fxFree = {}, {}, {}, {}, {}, {}
+	for _, t in ipairs(TYPES) do S.fxFree[t.id] = {} end
+	local function register(p, s)
+		S.pool[#S.pool + 1] = p
+		S.slots[#S.slots + 1] = s
+		S.saved[#S.saved + 1] = {p = p, cf = p.CFrame, anchored = p.Anchored, collide = p.CanCollide, color = p.Color, material = p.Material, transparency = p.Transparency}
+	end
+	local fi = 0
+	for _, c in ipairs(cells) do
+		local p = nextBrick(c.tp)
+		fi += 1
+		local s = {p = p, kind = "fk", tp = c.tp, bone = c.bone, off = c.pos - bones[c.bone].pv, orient = orientFor(p, c.code), color = c.color, tag = c.tag, fi = fi}
+		register(p, s)
+		S.body[#S.body + 1] = s
+	end
+	for _, c in ipairs(swordCells()) do
+		local p = nextBrick(c.tp)
+		fi += 1
+		local s = {p = p, kind = "sw", tp = c.tp, off = c.pos, orient = orientFor(p, c.code), color = c.color, tag = c.tag, fi = fi}
+		register(p, s)
+		S.body[#S.body + 1] = s
+	end
+	local fx = 0
+	for _, t in ipairs(TYPES) do
+		for _ = 1, EFFECT[t.id] or 0 do
+			local p = nextBrick(t.id)
+			fx += 1
+			local s = {p = p, kind = "fx", tp = t.id, fi = fx, orient = orientFor(p, "xzy"), color = COL.LIGHT, tag = "fx"}
+			register(p, s)
+			S.fxFree[t.id][#S.fxFree[t.id] + 1] = s
+		end
+	end
+	for _, s in ipairs(S.slots) do
+		local p = s.p
+		pcall(function() p.Anchored = false; p.CanCollide = false end)
+		pcall(function()
+			local bf = Instance.new("BodyForce")
+			bf.Name = "MichaelAntiG"
+			bf.Force = V(0, p.AssemblyMass * workspace.Gravity, 0)
+			bf.Parent = p
+		end)
+		pcall(function()
+			p.Color = s.color
+			p.Material = (s.kind ~= "fx" and (s.tag == "glow" or s.tag == "halo")) and Enum.Material.Neon or Enum.Material.SmoothPlastic
+			p.Transparency = 0
+		end)
+	end
+	pcall(function() lp.MaximumSimulationRadius = math.huge end)
+	pcall(function() sethiddenproperty(lp, "SimulationRadius", math.huge) end)
+	refreshFilters()
+
+	-- arena: in front of you, Michael faces you
+	local hcf = hrp.CFrame
+	local look = flatDir(hcf.LookVector)
+	local ap = hcf.Position + look * 48
+	S.pos = V(ap.X, 0, ap.Z)
+	S.hd = math.atan2(look.X, look.Z)
+	S.gy = groundAt(V(ap.X, hcf.Position.Y + 20, ap.Z), 60)
+	S.vel, S.curSp, S.h, S.dash, S.faceH, S.hold = V(), 0, 0, nil, nil, nil
+	S.flying, S.kneel, S.kneelK, S.swPlant, S.wingS = false, true, 1, 1, 0.25
+	S.bodyVis = false
+	S.control, S.targetPl, S.act = false, nil, nil
+	S.gt = {ph = 0, gait = 0}
+	for k in pairs(S.pose) do S.pose[k] = 0; S.poseT[k] = 0 end
+	S.world = {}
+	S.alive = true
+	step(0.016)
+	applyTargets()
+	CN.fade.BackgroundTransparency = 0
+	CN.fade.Visible = true
+	runIntro(Vector3.new(ap.X, 0, ap.Z), S.hd)
+	notify(string.format("Summoning Michael with %d bricks (%d body + %d effect)...", #S.slots, #S.body, fx), 5)
+end
+local function dismiss()
+	if not S.alive or S.dismissing then return end
+	S.dismissing = true
+	S.skip = true
+	S.targetPl = nil
+	task.spawn(function()
+		task.wait(0.25)
+		endCine()
+		S.act = "Dismiss"
+		S.flying, S.kneel = false, false
+		flash(V(S.pos.X, S.gy + 9, S.pos.Z), 18, COL.LIGHT)
+		feathers(V(S.pos.X, S.gy + 10, S.pos.Z), 14, 2)
+		local t0 = os.clock()
+		while os.clock() - t0 < 1.0 do
+			local k = (os.clock() - t0) / 1.0
+			for _, s in ipairs(S.body) do pcall(function() s.p.Transparency = clamp(k, 0, 1) end) end
+			RunService.Heartbeat:Wait()
+		end
+		finishDismiss()
+		notify("Michael dismissed. Bricks returned.", 3)
+	end)
+end
+
+-- GUI --------------------------------------------------------------------------------------------------------------------------------------------------------------
+local UI = {
+	ACC = Color3.fromRGB(255, 214, 110), BG = Color3.fromRGB(24, 22, 30), BTN = Color3.fromRGB(70, 62, 90),
+	GREEN = Color3.fromRGB(50, 120, 80), RED = Color3.fromRGB(170, 50, 60), BLUE = Color3.fromRGB(60, 90, 160), ATK = Color3.fromRGB(150, 110, 40),
+	ON = Color3.fromRGB(200, 120, 30),
+}
+local gui = mk("ScreenGui", {Name = "ArchangelMichaelGui", ResetOnSpawn = false, DisplayOrder = 50}, guiParent)
+local FULL_H = math.min(600, math.max(280, cam.ViewportSize.Y - 40))
+-- sits on the left edge beside the executor's own button; drag the title, "M" / RightControl opens and closes it
+local win = mk("Frame", {Size = UDim2.fromOffset(222, FULL_H), Position = UDim2.new(0, 46, 0.5, -FULL_H / 2),
+	BackgroundColor3 = UI.BG, BorderSizePixel = 0, Active = true}, gui)
+round(win, 12)
+mk("UIStroke", {Color = UI.ACC, Thickness = 2}, win)
+local title = mk("TextLabel", {Size = UDim2.new(1, -60, 0, 28), Position = UDim2.fromOffset(10, 0), BackgroundTransparency = 1,
+	Text = "ARCHANGEL MICHAEL", TextColor3 = UI.ACC, Font = Enum.Font.GothamBold, TextSize = 13, TextXAlignment = Enum.TextXAlignment.Left, Active = true}, win)
+local body = mk("ScrollingFrame", {Size = UDim2.new(1, -8, 1, -34), Position = UDim2.fromOffset(4, 30), BackgroundTransparency = 1,
+	BorderSizePixel = 0, ScrollBarThickness = 4, CanvasSize = UDim2.new()}, win)
+CN.win = win
+local y = 0
+local function nextRow(h)
+	local r = mk("Frame", {Size = UDim2.new(1, -8, 0, h), Position = UDim2.fromOffset(0, y), BackgroundTransparency = 1}, body)
+	y += h + 6
+	return r
+end
+local function btn(r, text, x, w, cb, color)
+	local b = mk("TextButton", {Size = UDim2.new(w, -3, 1, 0), Position = UDim2.new(x, 1.5, 0, 0), BackgroundColor3 = color or UI.BTN, Text = text,
+		TextColor3 = Color3.new(1, 1, 1), Font = Enum.Font.GothamBold, TextSize = 12, TextWrapped = true}, r)
+	round(b)
+	b.Activated:Connect(function() cb(b) end)
+	return b
+end
+local function header(text)
+	local r = nextRow(16)
+	mk("TextLabel", {Size = UDim2.new(1, 0, 1, 0), BackgroundTransparency = 1, Text = text, TextColor3 = UI.ACC, Font = Enum.Font.GothamBold,
+		TextSize = 12, TextXAlignment = Enum.TextXAlignment.Left}, r)
+end
+local W2 = {}
+local function syncButtons()
+	W2.summon.Text = S.alive and "Dismiss Michael" or "Summon Michael"
+	W2.summon.BackgroundColor3 = S.alive and UI.RED or UI.GREEN
+	W2.control.Text = "CONTROL: " .. (S.control and "ON" or "OFF")
+	W2.control.BackgroundColor3 = S.control and UI.ON or UI.BLUE
+	W2.fly.Text = "FLY: " .. (S.flying and "ON" or "OFF")
+	W2.fly.BackgroundColor3 = S.flying and UI.ON or UI.BLUE
+	W2.kneel.Text = S.kneel and "KNEEL: ON (stand up)" or "KNEEL (pose)"
+	W2.kneel.BackgroundColor3 = S.kneel and UI.ON or UI.BLUE
+	W2.target.Text = S.targetPl and "Target ON" or "Target"
+	W2.target.BackgroundColor3 = S.targetPl and UI.ON or UI.RED
+	if W2.ctrlFloat then W2.ctrlFloat.BackgroundColor3 = S.control and UI.ON or UI.BG end
+end
+local function checkBricks()
+	local ok, lines = runDiagnosis()
+	if ok == nil then
+		W2.info.Text = "Cannot scan: " .. tostring(lines[1])
+		return
+	end
+	W2.info.Text = string.format("Michael = %d bricks (100 body + 110 effect), 10 sizes\n%s\n=> %s", TOTAL, table.concat(lines, "\n"),
+		ok and "READY TO SUMMON" or "NOT ENOUGH BRICKS")
+end
+local function toggleSummon()
+	if S.alive then dismiss() else summon() end
+	syncButtons()
+end
+local function guardAlive()
+	if not S.alive then notify("Summon Michael first", 3) return false end
+	if S.cut or S.dismissing then notify("Wait for the cutscene (or press Skip)", 3) return false end
+	return true
+end
+local function toggleControl()
+	if not guardAlive() then return end
+	setControl(not S.control)
+	notify(S.control and "CONTROL ON - pad / WASD / joystick move Michael, the camera follows him" or "Control off - Michael stays near you", 5)
+	syncButtons()
+end
+local function targetToggle()
+	if not guardAlive() then return end
+	if S.targetPl then
+		S.targetPl = nil
+		notify("Target cleared (skills aim at the nearest player)", 3)
+		syncButtons()
+		return
+	end
+	if W2.name.Text:match("^%s*$") then notify("Type a player name first", 3) return end
+	local pl = findPlayer(W2.name.Text)
+	if not pl then notify("Player not found: " .. W2.name.Text, 3) return end
+	if not targetHrp(pl) then notify("That player has no character", 3) return end
+	S.targetPl = pl
+	notify("Targeting: " .. pl.DisplayName, 4)
+	syncButtons()
+end
+local function unload()
+	for _, c in ipairs(S.conns) do pcall(function() c:Disconnect() end) end
+	pcall(function() RunService:UnbindFromRenderStep("MichaelShake") end)
+	S.skip = true
+	S.cut = false
+	if S.walk then pcall(function() hum.WalkSpeed = S.walk end) end
+	pcall(function() cam.CameraType = Enum.CameraType.Custom end)
+	if S.alive then finishDismiss() end
+	skyDim(false)
+	gui:Destroy()
+	CN.cine:Destroy()
+	_G.ArchangelMichael = nil
+end
+_G.ArchangelMichael = unload
+
+local ABIL = {
+	{"Slash (1)", "Slash"}, {"Sword Beam (2)", "Beam"}, {"Teleport Behind (3)", "Teleport"},
+	{"Fly Slash (6)", "FlySlash"}, {"Fly Beam (7)", "FlyBeam"},
+}
+do
+	W2.summon = btn(nextRow(32), "Summon Michael", 0, 1, toggleSummon, UI.GREEN)
+	local r1 = nextRow(30)
+	W2.control = btn(r1, "CONTROL", 0, 0.5, toggleControl, UI.BLUE)
+	W2.fly = btn(r1, "FLY", 0.5, 0.5, toggleFly, UI.BLUE)
+	W2.kneel = btn(nextRow(30), "KNEEL (pose)", 0, 1, toggleKneel, UI.BLUE)
+	header("Target a player (optional)")
+	W2.name = mk("TextBox", {Size = UDim2.new(1, -8, 0, 24), Position = UDim2.fromOffset(0, y), BackgroundColor3 = UI.BTN, Text = "",
+		PlaceholderText = "Type player name", PlaceholderColor3 = Color3.fromRGB(190, 180, 210), TextColor3 = Color3.new(1, 1, 1),
+		Font = Enum.Font.GothamMedium, TextSize = 12, ClearTextOnFocus = false}, body)
+	round(W2.name)
+	y += 30
+	W2.target = btn(nextRow(28), "Target", 0, 1, targetToggle, UI.RED)
+	header("Skills")
+	for i = 1, #ABIL, 2 do
+		local r = nextRow(30)
+		local a, b = ABIL[i], ABIL[i + 1]
+		btn(r, a[1], 0, b and 0.5 or 1, function() runSkill(a[2]) end, UI.ATK)
+		if b then btn(r, b[1], 0.5, 0.5, function() runSkill(b[2]) end, UI.ATK) end
+	end
+	header("Brick check")
+	local ri = nextRow(170)
+	W2.info = mk("TextLabel", {Size = UDim2.new(1, -8, 1, 0), BackgroundColor3 = Color3.fromRGB(36, 32, 44), Text = "", TextColor3 = Color3.new(1, 1, 1),
+		Font = Enum.Font.Code, TextSize = 10, TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top}, ri)
+	round(W2.info)
+	CNinfo.lbl = W2.info
+	btn(nextRow(26), "Check bricks", 0, 1, checkBricks)
+	btn(nextRow(24), "Sound: ON", 0, 1, function(b)
+		S.sfxOn = not S.sfxOn
+		b.Text = "Sound: " .. (S.sfxOn and "ON" or "OFF")
+	end, UI.GREEN)
+	btn(nextRow(24), "Unload script", 0, 1, function() unload() end, UI.RED)
+end
+S.statusLbl = mk("TextLabel", {Size = UDim2.new(1, -8, 0, 60), Position = UDim2.fromOffset(0, y), BackgroundTransparency = 1, Text = "",
+	TextColor3 = Color3.fromRGB(225, 215, 190), Font = Enum.Font.Gotham, TextSize = 10, TextWrapped = true,
+	TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top}, body)
+body.CanvasSize = UDim2.fromOffset(0, y + 68)
+local function headerBtn(text, x, cb)
+	local b = mk("TextButton", {Size = UDim2.fromOffset(22, 20), Position = UDim2.new(1, x, 0, 4), BackgroundColor3 = UI.BTN, Text = text,
+		TextColor3 = Color3.new(1, 1, 1), Font = Enum.Font.GothamBold, TextSize = 14}, win)
+	round(b, 6)
+	b.Activated:Connect(cb)
+end
+local minimized = false
+headerBtn("-", -48, function()
+	minimized = not minimized
+	body.Visible = not minimized
+	win.Size = UDim2.fromOffset(222, minimized and 28 or FULL_H)
+end)
+headerBtn("x", -25, function() win.Visible = false end)
+CN.open = mk("TextButton", {Size = UDim2.fromOffset(34, 34), Position = UDim2.new(0, 6, 0.5, -17), BackgroundColor3 = UI.BG, Text = "M",
+	TextColor3 = UI.ACC, Font = Enum.Font.GothamBlack, TextSize = 16, ZIndex = 5}, gui)
+round(CN.open, 17)
+mk("UIStroke", {Color = UI.ACC, Thickness = 2}, CN.open)
+CN.open.Activated:Connect(function() win.Visible = not win.Visible end)
+W2.ctrlFloat = mk("TextButton", {Size = UDim2.fromOffset(34, 34), Position = UDim2.new(0, 6, 0.5, 24), BackgroundColor3 = UI.BG, Text = "C",
+	TextColor3 = UI.ACC, Font = Enum.Font.GothamBlack, TextSize = 16, ZIndex = 5}, gui)
+round(W2.ctrlFloat, 17)
+mk("UIStroke", {Color = UI.ACC, Thickness = 2}, W2.ctrlFloat)
+W2.ctrlFloat.Activated:Connect(toggleControl)
+
+W2.pad = mk("Frame", {Size = UDim2.fromOffset(236, 170), AnchorPoint = Vector2.new(1, 1), Position = UDim2.new(1, -14, 1, -24),
+	BackgroundTransparency = 1, Visible = false, ZIndex = 8}, gui)
+local function padBtn(txt, x, yy, key)
+	local b = mk("TextButton", {Size = UDim2.fromOffset(54, 54), Position = UDim2.fromOffset(x, yy), BackgroundColor3 = UI.BG, BackgroundTransparency = 0.2,
+		Text = txt, TextColor3 = Color3.new(1, 1, 1), Font = Enum.Font.GothamBold, TextSize = 13, AutoButtonColor = true, ZIndex = 9}, W2.pad)
+	round(b, 12)
+	mk("UIStroke", {Color = UI.ACC, Thickness = 1.5}, b)
+	b.InputBegan:Connect(function(i)
+		if i.UserInputType == Enum.UserInputType.Touch or i.UserInputType == Enum.UserInputType.MouseButton1 then S.pad[key] = true end
+	end)
+	b.InputEnded:Connect(function(i)
+		if i.UserInputType == Enum.UserInputType.Touch or i.UserInputType == Enum.UserInputType.MouseButton1 then S.pad[key] = false end
+	end)
+end
+padBtn("FWD", 58, 0, "f")
+padBtn("LEFT", 0, 58, "l")
+padBtn("RIGHT", 116, 58, "r")
+padBtn("BACK", 58, 116, "b")
+padBtn("UP", 182, 0, "u")
+padBtn("DOWN", 182, 116, "d")
+do -- drag by title
+	local dragging, startPos, startIn
+	title.InputBegan:Connect(function(i)
+		if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+			dragging, startPos, startIn = true, win.Position, i.Position
+		end
+	end)
+	table.insert(S.conns, UIS.InputChanged:Connect(function(i)
+		if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
+			local d = i.Position - startIn
+			win.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+		end
+	end))
+	table.insert(S.conns, UIS.InputEnded:Connect(function(i)
+		if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then dragging = false end
+	end))
+end
+
+-- input / loops ------------------------------------------------------------------------------------------------------------------------------------------------------
+local KEYMAP = {
+	[Enum.KeyCode.One] = function() runSkill("Slash") end,
+	[Enum.KeyCode.Two] = function() runSkill("Beam") end,
+	[Enum.KeyCode.Three] = function() runSkill("Teleport") end,
+	[Enum.KeyCode.Four] = function() toggleKneel() end,
+	[Enum.KeyCode.Five] = function() toggleFly() end,
+	[Enum.KeyCode.Six] = function() runSkill("FlySlash") end,
+	[Enum.KeyCode.Seven] = function() runSkill("FlyBeam") end,
+}
+table.insert(S.conns, UIS.InputBegan:Connect(function(i, gp)
+	if gp then return end
+	if i.KeyCode == Enum.KeyCode.RightControl then win.Visible = not win.Visible return end
+	local f = KEYMAP[i.KeyCode]
+	if f then f() end
+end))
+table.insert(S.conns, lp.CharacterAdded:Connect(function(c)
+	refChar(c)
+	if S.alive then refreshFilters() end
+end))
+table.insert(S.conns, RunService.RenderStepped:Connect(function(dt)
+	local show = S.control and S.alive and not S.cut
+	W2.pad.Visible = show
+	W2.ctrlFloat.Visible = not S.cut
+	if not show then for k in pairs(S.pad) do S.pad[k] = false end end
+	if S.alive and hrp and hrp.Parent then
+		local ok, err = pcall(step, math.min(dt, 0.05))
+		if ok then
+			applyTargets()
+		else
+			S.errT += dt
+			if S.errT > 0.5 then S.errT = 0; notify("script error: " .. tostring(err), 6); warn("[ArchangelMichael] " .. tostring(err)) end
+		end
+	end
+	S.statT += dt
+	if S.statT > 0.4 then
+		S.statT = 0
+		syncButtons()
+		if os.clock() > S.noticeUntil then
+			if S.alive then
+				local st = S.act and S.act:upper() or (S.cut and "CUTSCENE") or (S.kneel and "Kneeling") or (S.flying and "Flying") or (S.control and "Controlled") or "Idle"
+				S.statusLbl.Text = string.format("%s | %d bricks | lost %d", st, #S.slots, S.lostN)
+			else
+				S.statusLbl.Text = string.format("Ready. Needs %d bricks of 10 sizes. Press Check bricks.", TOTAL)
+			end
+		end
+	end
+end))
+table.insert(S.conns, RunService.Heartbeat:Connect(function() if S.alive then applyTargets() end end))
+table.insert(S.conns, RunService.Stepped:Connect(function() if S.alive then applyTargets() end end))
+
+pcall(checkBricks)
+syncButtons()
+print(string.format("[ARCHANGEL MICHAEL] loaded - %d bricks needed: C=%d K=%d R=%d P=%d Q=%d M=%d D=%d T=%d V=%d L=%d", TOTAL,
+	NEED.C, NEED.K, NEED.R, NEED.P, NEED.Q, NEED.M, NEED.D, NEED.T, NEED.V, NEED.L))
